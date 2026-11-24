@@ -42,10 +42,14 @@ Result: 7 failed, 8 passed, 2.2 s.
 | `test_c6_hot_payee` | lost updates on the payee: `201000 == (200000 + (20 * 1000))` |
 | `test_statement_order[*]` | the lock query became `other: SELECT firms.id, ... FROM firms WHERE ...` |
 
-C5 and C8 still pass under M1, as they should. Without the locking clause the request no longer
-waits at the lock query, but the foreign-key check of the payments insert takes `FOR KEY SHARE`
-on the payer row. That conflicts with the external `FOR UPDATE`, so the request still waits
-there and runs into `lock_timeout`.
+C5 and C8 still pass under M1, as they should, for different reasons:
+
+- C5: without the locking clause the request no longer waits at the lock query. But the
+  foreign-key check of the payments insert takes `FOR KEY SHARE` on the payer row, which
+  conflicts with the external `FOR UPDATE`. So the request still waits there and runs into
+  `lock_timeout`.
+- C8: the request waits on the `idempotency_keys` insert and never reaches the firm query,
+  so M1 cannot affect it.
 
 ### M2: no ORDER BY
 
@@ -75,8 +79,9 @@ transactions with no deadlock and no `busy`, whereas the design probe saw 80 dea
 executemany in primary-key order: a request from Nair (id 3) to Pinecrest (id 1) and Lopez (id 2)
 updates ids 1, 2, 3 in that order (checked). So in C2 every transaction writes the new version
 of A before the new version of B, and the sequential scan of the lock query (the plan without
-`ORDER BY` is `LockRows` over `Seq Scan`) keeps finding the two rows in the same order. The probe
-probably updated payer then payee, which alternates the heap order. C3 touches overlapping
+`ORDER BY` is `LockRows` over `Seq Scan`) keeps finding the two rows in the same order. Why the
+probe saw deadlocks is not verified: the probe is not in the repository. One possibility is that
+it updated payer then payee, which would alternate the heap order. C3 touches overlapping
 subsets of six firms, so heap order and id order drift apart, and different snapshots see
 different orders. Spec 13.7 expects "C2 or C3" to fail; C3 is the test that catches M2 here.
 
@@ -114,7 +119,7 @@ These are the five claims at the end of spec section 17.
 
 | Claim | Settled by | Result |
 |---|---|---|
-| Lock acquisition order for `ORDER BY ... FOR NO KEY UPDATE` | `test_c2_crossing_payments` (20 rounds × 50 crossing transactions), `test_c3_cycle_and_random_mix` (200 batches, cycle A→B→C→A, seed 20261121, 16 threads), mutations M2 and M3, `EXPLAIN` of the lock query | Confirmed. With `ORDER BY id`, C2 and C3 had no `busy` outcome and logged no deadlock in any run. Without it, C3 deadlocks (M2, 3 of 3 runs). On PostgreSQL 18.6, `EXPLAIN` gives `LockRows` above `Sort (Sort Key: id)` above `Seq Scan on firms`, the plan the spec describes. Caveat: the crossing workload alone (C2) does not deadlock without `ORDER BY` here (see M2). |
+| Lock acquisition order for `ORDER BY ... FOR NO KEY UPDATE` | `test_c2_crossing_payments` (20 rounds × 50 crossing transactions), `test_c3_cycle_and_random_mix` (200 batches, cycle A→B→C→A, seed 20261121, 16 threads), mutations M2 and M3, a manual `EXPLAIN` (not a test) | Confirmed. With `ORDER BY id`, C2 and C3 had no `busy` outcome and logged no deadlock in any run. Without it, C3 deadlocks (M2, 3 of 3 runs). On PostgreSQL 18.6, a hand-written equivalent of the lock query (`SELECT id, uuid, balance_cents FROM firms WHERE uuid IN (...) ORDER BY id FOR NO KEY UPDATE`), run once on the test database with the three seed rows, plans as `LockRows` above `Sort (Sort Key: id)` above `Seq Scan on firms`. That is the plan the spec describes. Caveat: the crossing workload alone (C2) does not deadlock without `ORDER BY` here (see M2). |
 | `ON CONFLICT DO NOTHING` after waiting on another transaction | `test_i5_same_key_in_parallel` (10 rounds × 8 threads, one key), `test_key_wait_then_commit_replays`, `test_key_wait_then_rollback_executes` | Confirmed. Each I5 round gave exactly 1 `created` and 7 `replayed`, identical bodies, 3 payment rows, Pinecrest 3 674 875 and one key row. With another transaction holding the key row, the request waits. After that transaction commits, the request returns the committed response and changes nothing. After it rolls back, the request executes and claims the key. |
 | `lock_timeout` bounds the unique-index wait; error code 55P03 | `test_key_wait_respects_lock_timeout` (C8), `test_c5_lock_timeout`, `test_c5_http_503` | Confirmed. With an uncommitted key row held elsewhere and `lock_timeout_ms=200`, the request returns `busy` after at least 200 ms, and the cause is SQLSTATE `55P03`. The row-lock wait (C5) behaves the same way. Over HTTP the response is 503 `busy` with `Retry-After: 1`. Nothing changed in any of these cases. |
 | 422 for invalid JSON and non-object bodies in FastAPI 0.165.0 | `tests/api/test_validation.py::test_non_object_bodies` (`[]`, `"x"`, `null`, `123`, invalid JSON, empty body, JSON sent as `text/plain`, invalid UTF-8) and `::test_a9_schema_violations` | Confirmed. Every case gives 422 `validation_error`. |

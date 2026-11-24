@@ -1,3 +1,4 @@
+import email.message
 import json
 import logging
 import socket
@@ -104,6 +105,21 @@ async def handle_domain_error(request: Request, exc: DomainError) -> JSONRespons
     )
 
 
+def _is_json_content_type(content_type: str | None) -> bool:
+    """FastAPI's rule: only application/json and application/*+json bodies are parsed.
+
+    Without the header the body is not parsed either (strict_content_type).
+    """
+    if not content_type:
+        return False
+    message = email.message.Message()
+    message["content-type"] = content_type
+    subtype = message.get_content_subtype()
+    return message.get_content_maintype() == "application" and (
+        subtype == "json" or subtype.endswith("+json")
+    )
+
+
 async def handle_request_validation_error(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
@@ -117,9 +133,12 @@ async def handle_request_validation_error(
         }
         for error in exc.errors()
     ]
-    return _error_response(
-        request, 422, "validation_error", "the request is invalid", details=details
-    )
+    if _is_json_content_type(request.headers.get("content-type")):
+        message = "the request is invalid"
+    else:
+        # The body reached validation as raw bytes, for example from `curl -d`.
+        message = "the request body must be JSON sent with Content-Type: application/json"
+    return _error_response(request, 422, "validation_error", message, details=details)
 
 
 async def handle_http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:

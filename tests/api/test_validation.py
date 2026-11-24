@@ -7,7 +7,17 @@ from app.db import get_session
 from app.errors import ServiceBusy
 from app.main import app
 from app.schemas import INT32_MAX
-from tests.conftest import LOPEZ, NAIR, PINECREST, balances, bulk, payment_rows, set_balance
+from tests.conftest import (
+    LOPEZ,
+    NAIR,
+    PINECREST,
+    ROOT,
+    SAMPLE_REQUEST,
+    balances,
+    bulk,
+    payment_rows,
+    set_balance,
+)
 
 JSON = {"Content-Type": "application/json"}
 
@@ -75,6 +85,36 @@ def test_non_object_bodies(client, db, content, headers):
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "validation_error"
     assert payment_rows(db) == []
+
+
+NON_JSON_CONTENT_TYPES = {
+    # curl -d sends a file as form data unless told otherwise.
+    "form_urlencoded": {"Content-Type": "application/x-www-form-urlencoded"},
+    "text_plain": {"Content-Type": "text/plain"},
+    "missing": {},
+}
+
+
+@pytest.mark.parametrize(
+    "headers", NON_JSON_CONTENT_TYPES.values(), ids=NON_JSON_CONTENT_TYPES.keys()
+)
+def test_non_json_content_type_names_application_json(client, db, headers):
+    content = (ROOT / "sample-request.json").read_bytes()
+    r = client.post("/bulk-payments", content=content, headers=headers)
+    error = assert_validation_error(r)
+    assert "Content-Type: application/json" in error["message"]
+    for payment in SAMPLE_REQUEST["payments"]:
+        assert payment["description"] not in r.text
+    assert payment_rows(db) == []
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    ["application/json", "Application/JSON; charset=utf-8", "application/vnd.api+json"],
+)
+def test_json_content_type_keeps_generic_message(client, content_type):
+    r = client.post("/bulk-payments", content=b"[]", headers={"Content-Type": content_type})
+    assert assert_validation_error(r)["message"] == "the request is invalid"
 
 
 def test_lone_surrogate_in_description(client, db):

@@ -427,7 +427,7 @@ The task does not specify these; `docs/spec.md` section 4 has the reasoning for 
 1. Requests are not authenticated; `payer_firm_uuid` is taken from the body as is.
 2. `firms.uuid` is stored in lowercase canonical form; incoming UUIDs are normalised to it.
 3. Balances and amounts fit in 32-bit `INTEGER`, as in the task's tables; exceeding the bound is a 422.
-4. Other parts of the platform may allow negative balances, so there is no `CHECK (balance_cents >= 0)`. This service never drives a balance below zero.
+4. Other parts of the platform may legitimately allow a negative balance, so the database has no constraint `CHECK (balance_cents >= 0)` on `firms`. This service still never drives a balance below zero: it checks the payer's balance in code, under the row lock (`app/service.py`).
 5. A payment from a firm to itself is rejected.
 6. Two identical requests without a key are two legitimate batches, not a duplicate.
 7. Payments are initiated by people, so the rate per firm is modest. The load run measured about 600 batches per second through one firm.
@@ -443,7 +443,7 @@ The task does not specify these; `docs/spec.md` section 4 has the reasoning for 
 3. Keys are kept forever. Improvement: publish a retention period of at least 24 hours, so that client retries stay safe, and delete older keys by `created_at`.
 4. `INTEGER` limits balances to about $21.4 million. Improvement: `BIGINT`, which changes the given schema.
 5. A hot payer's batches run strictly one after another. A hot payee queues its payers. Improvement: a journal of credits with deferred balance recalculation.
-6. There is no `CHECK (balance_cents >= 0)` as a last line of defence (assumption 4).
+6. The database has no `CHECK (balance_cents >= 0)` constraint as a last line of defence. The balance check in code is the only guard, so a bug in it would not be stopped by the database (assumption 4). Improvement: add the constraint once it is clear that no other part of the platform needs negative balances.
 7. Payments have no creation time and no batch id.
 8. There are no metrics or tracing beyond the structured logs.
 9. Connections grow with the number of instances. Improvement: a database-side pool such as PgBouncer.

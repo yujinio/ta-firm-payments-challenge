@@ -66,7 +66,7 @@ The service runs as several instances behind a load balancer and uses a relation
 1. **[A]** The request is not authenticated: `payer_firm_uuid` from the body is accepted as is. In a real system the payer would be determined from the session.
 2. **[A]** `firms.uuid` is stored in lowercase canonical form, as in the example. Incoming UUIDs are normalized to this form.
 3. **[A]** Balances and amounts fit in a 32-bit `INTEGER` (up to 2,147,483,647 cents, about $21.4 million). Exceeding the bound is a 422, not a database error.
-4. **[A]** A negative balance may be valid in other parts of the platform, so `CHECK (balance_cents >= 0)` is not added. The service itself never drives a balance below zero.
+4. **[A]** A negative balance may be valid in other parts of the platform, so the database constraint `CHECK (balance_cents >= 0)` is not added. The service itself never drives a balance below zero: it checks the payer's balance in code, under the row lock (section 8.2, step 5).
 5. **[A]** A payment from a firm to itself is meaningless and is rejected.
 6. **[A]** Two identical requests in a row without an idempotency key are a legitimate operation, not an error.
 7. **[A]** Payments are initiated by people, so the request rate per firm is modest. The estimate "hundreds of batches per second through one firm" is calculated, not measured; the load scenario verifies it (section 13.5).
@@ -658,7 +658,7 @@ Step 6 checks understanding of the task on the task's own data: the balance afte
 3. `INTEGER` limits balances to about $21.4 million. Improvement: `BIGINT`.
 4. A "hot" payee queues payers. Improvement: a journal of credits with deferred balance recalculation.
 5. No authentication and no authorization check for the debit.
-6. No `CHECK (balance_cents >= 0)` as a last line of defense (assumption 4).
+6. No database constraint `CHECK (balance_cents >= 0)` as a last line of defense (assumption 4): the check in code is the only guard. Improvement: add the constraint once no other part of the platform needs negative balances.
 7. Payments have no creation time and no batch identifier.
 8. No metrics or tracing.
 9. The number of connections grows with the number of instances. Improvement: a database-side pool (PgBouncer).

@@ -1,7 +1,7 @@
 # Firm Payments: Bulk Payment Service Specification
 
 - Date: 2026-11-21
-- Status: approved; revision 3 (2026-11-24). Revision 2 folded in the rules found while planning and the probe results of section 17. Revision 3 adds the run stand (section 5.6) and the justified batch limit (section 5.7)
+- Status: approved; revision 4 (2026-11-24). Revision 2 folded in the rules found while planning and the probe results of section 17. Revision 3 adds the run stand (section 5.6) and the justified batch limit (section 5.7). Revision 4 follows a validation against the task statement: the second request from the task (page 3) becomes a sample, the rationale for the service table is restated, the Python version is pinned, and the local container runtime is recorded
 - Location in repository: `docs/spec.md`
 - Basis: TaxDome technical challenge "Firm Payments: Build a bulk payment service" (PDF, 5 pages)
 
@@ -57,8 +57,8 @@ The service runs as several instances behind a load balancer and uses a relation
 | R6 | Amount: a string, dollars, at most two optional decimal places, always positive | p. 3 |
 | R7 | Tables `firms` and `payments` with the given columns | p. 3 |
 | R8 | The example from the task yields balances of $36,748.75 / $1,700.75 / $14,050.50 | p. 4 |
-| R9 | Python, commonly used libraries | p. 2 |
-| R10 | The repository can be cloned, installed, run and sent the example | p. 5 |
+| R9 | One of Ruby, Python or Go (Python is our choice); commonly used libraries | p. 2 |
+| R10 | The repository can be cloned, installed, run and sent the sample requests: both the request on page 3 and the one on page 4 | p. 3, 4, 5 |
 | R11 | Commit history, AI conversation logs, README written as a pull request, two questions at the end | p. 5 |
 
 ## 4. Assumptions
@@ -83,9 +83,9 @@ The service runs as several instances behind a load balancer and uses a relation
 |---|---|---|
 | Strictly as specified | Two tables, request as written, idempotency only in the README | Rejected: a retry after a timeout creates a second batch of payments |
 | **Additive extension** | Optional `Idempotency-Key` header and a service table; the given tables and examples work unchanged | **[R] Chosen** |
-| Changing the given tables | `BIGINT`, `batch_id`, `created_at`, `CHECK` | Rejected: contradicts the task's statement that there are two tables |
+| Changing the given tables | `BIGINT`, `batch_id`, `created_at`, `CHECK` | Rejected: changes the columns and types the task gives for `firms` and `payments` |
 
-Rationale [R]: the task does not forbid extension, and without a key duplicates cannot be prevented.
+Rationale [R]: the task does not forbid extension, and without a key duplicates cannot be prevented. The task describes the platform's database as two tables; the chosen option keeps both exactly as given and adds a service table, `idempotency_keys`, next to them. The service writes to it only when a request carries the `Idempotency-Key` header, so a request made strictly as the task describes touches only the two given tables.
 
 ### 5.2. Where to store the idempotency key
 
@@ -146,7 +146,7 @@ The number is a property of the stand, not a capacity recommendation.
 **Consequences of the stand:**
 
 - Migrations run once, in a separate `migrate` service that the replicas wait for. Three replicas each running `alembic upgrade head` at start would race.
-- Each replica is a single Uvicorn process. Replicas publish no host port; only the balancer does.
+- Each replica is a single Uvicorn process. Replicas publish no host port. The balancer publishes port 8000; `db` publishes `127.0.0.1:5432` so that tests and the multi-process test server can run on the host.
 - nginx does not pass a `POST` to another replica once it has been sent to one, so the balancer never duplicates a payment by itself. A request that could not be delivered at all is passed to the next replica. Retrying after a lost response stays the client's job, with an idempotency key.
 - nginx resolves the replica addresses when it starts. After replicas are recreated or rescaled, the balancer must be restarted.
 - The balancer adds the response header `X-Upstream` with the address of the replica that served the request, so the distribution can be observed (check S2).
@@ -182,7 +182,7 @@ A consequence to state in the README: a client with more than 1,000 payments spl
 
 | Component | Choice | Status |
 |---|---|---|
-| Language | Python 3.12+ | [P] |
+| Language | Python 3.14, pinned in `.python-version` and in the Docker base image so that host runs and the image use the same minor version. 3.15 is too recent to rely on wheels for every dependency | [R] |
 | Web | FastAPI, Uvicorn | [R] |
 | Validation | Pydantic v2, pydantic-settings | [P] |
 | ORM | SQLAlchemy 2.x, synchronous mode (2.1 is current as of 2026-11-21) | [R] |
@@ -446,7 +446,8 @@ app/
   errors.py        domain errors and their codes
 migrations/        Alembic
 tests/
-  unit/            amount parsing, request hash
+  unit/            amount parsing, request hash; no database
+  db/              schema and migrations
   api/             contract
   concurrency/     races, locks, idempotency under parallel load
 scripts/
@@ -454,11 +455,14 @@ scripts/
   load.py          load scenarios
 docs/
   spec.md          this document
-ai-logs/           unedited logs of AI work
+ai-logs/           logs of AI work (section 14.3)
 deploy/
   nginx.conf       balancer configuration
 docker-compose.yml db, migrate, app (three replicas), lb
-sample-request.json  the request from page 4 of the task
+Makefile           up, seed, reset, test, lint, check, load
+.python-version    3.14
+sample-request.json          the request from page 4 of the task
+format-example-request.json  the request from page 3 of the task
 README.md
 ```
 
@@ -512,6 +516,7 @@ The verification question: is the service built according to this specification?
 | A13 | Payment order in response | Matches request order |
 | A14 | Body that is not a JSON object: invalid JSON, `[]`, `"x"`, `null`, `123`, an empty body, JSON sent as `text/plain` | 422 `validation_error` |
 | A15 | Body of a successful response | Contains no balance |
+| A16 | The request from page 3 of the task on the seeded database | 201; balances 4849925 / 170075 / 230000; two rows in `payments` |
 
 ### 13.4. Idempotency
 
@@ -572,6 +577,8 @@ A mutation that leaves every test green means the tests are too weak and must be
 
 Docker was not available where the design probes ran, so S1–S3 are the first real verification of the stand. Until then it rests on the nginx and Compose documentation (section 17).
 
+The development machine runs Podman 5.8 (rootful, netavark) behind the `docker` command, with Docker Compose v5.1 as the compose provider. Reviewers will most likely run Docker Engine or Docker Desktop. S1–S3 are therefore run locally on Podman, and CI on GitHub-hosted runners exercises the same `docker compose` commands on Docker Engine. The README states where each was verified. If the stand behaves differently under Podman (replica count, service-name DNS returning every replica, `--wait`), the difference is reported with evidence, not worked around in the Compose file.
+
 ## 14. Validation
 
 The validation question: does the service solve the problem stated in the task?
@@ -589,7 +596,7 @@ The validation question: does the service solve the problem stated in the task?
 | R7 | 7.1 | Migrations; A1 uses the `INSERT` from the task unchanged |
 | R8 | — | A1 and a manual run per the README |
 | R9 | 6 | Dependency review |
-| R10 | 11 | Acceptance run (14.2) |
+| R10 | 11 | A1, A16, acceptance run (14.2) |
 | R11 | — | Submission checklist (14.3) |
 
 ### 14.2. Acceptance run
@@ -602,15 +609,16 @@ Performed on a clean clone, strictly following the README, with no knowledge bey
 4. Send the example from the task with `curl` to the balancer on port 8000.
 5. Verify: response 201, balances $36,748.75 / $1,700.75 / $14,050.50.
 6. Send the same request three more times: two responses 201, then 422 (the balance covers three batches of four: 50,000 − 3 × 13,251.25 = 10,246.25).
-7. Run the tests with one command.
-8. Run stand checks S2 and S3.
+7. Reset the database to the three seeded firms with one command, send the request from page 3 of the task, and verify: response 201, balances $48,499.25 / $1,700.75 / $2,300.00.
+8. Run the tests with one command.
+9. Run stand checks S2 and S3.
 
-Step 6 checks understanding of the task on the task's own data: the balance after the third batch is less than the batch total.
+Step 6 checks understanding of the task on the task's own data: the balance after the third batch is less than the batch total. Step 7 covers the second request the task shows; the task asks that "the sample requests" can be sent.
 
 ### 14.3. Submission checklist
 
 - The commit history reflects the progress of the work.
-- `ai-logs/` contains unedited logs; the README names the tools and where each fit into the workflow.
+- `ai-logs/` contains the logs of the working sessions: the design sessions, the validation and execution session (with each subagent's transcript) and the review session. The only change to them is masking the account email and the home directory path. The README names the tools, says where each fit into the workflow, and states plainly what was masked and which sessions were left out (aborted early attempts).
 - The README contains: the solution and approach, encountered problems, assumptions, possible improvements, how to run and verify, answers to the two questions.
 - The assumptions section of the README matches section 4; the improvements section matches section 15.
 
@@ -619,7 +627,7 @@ Step 6 checks understanding of the task on the task's own data: the balance afte
 - Fit with the reviewers' infrastructure and team practices: nothing is known about them.
 - The assumptions in section 4: they are reasonable but not confirmed by the client.
 - Behavior when the database itself fails, and under replication.
-- Requests the reviewers may send beyond the task's example. The task defines no limits, no rule for unknown fields and no endpoint path. A request that exceeds our limits, carries an extra field or omits `description` gets 422 here. These choices are assumptions 8–11.
+- Requests the reviewers may send beyond the task's two examples. The task defines no limits, no rule for unknown fields and no endpoint path. A request that exceeds our limits, carries an extra field or omits `description` gets 422 here. These choices are assumptions 8–11.
 - The stand runs on one host: three replicas, one nginx and one PostgreSQL in Compose. It shows the load-balanced arrangement the task describes, not a highly available deployment: the balancer and the database are single points of failure.
 
 ## 15. Known limitations and improvements

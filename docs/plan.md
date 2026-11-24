@@ -6,15 +6,15 @@
 
 **Architecture:** A synchronous FastAPI app over PostgreSQL. One database transaction per request: claim the idempotency key, lock every firm in the batch with a single `ORDER BY id ... FOR NO KEY UPDATE` query, check the balance in Python, insert payments, update balances, commit. No in-process state; all coordination is in the database. The run stand is Docker Compose: PostgreSQL, a one-shot migration service, three application replicas and an nginx balancer.
 
-**Tech Stack:** Python 3.12+, FastAPI, Uvicorn, Pydantic v2, pydantic-settings, SQLAlchemy 2.x (sync), psycopg 3, Alembic, PostgreSQL 18, pytest, httpx, ruff, mypy, uv, Docker Compose, nginx.
+**Tech Stack:** Python 3.14, FastAPI, Uvicorn, Pydantic v2, pydantic-settings, SQLAlchemy 2.x (sync), psycopg 3, Alembic, PostgreSQL 18, pytest, httpx, ruff, mypy, uv, Docker Compose, nginx.
 
-**Spec:** `docs/spec.md`, revision 3 (read it in full before any task; section numbers below refer to it).
+**Spec:** `docs/spec.md`, revision 4 (read it in full before any task; section numbers below refer to it).
 
 **Location in repository:** `docs/plan.md`
 
 ## Global Constraints
 
-- Python 3.12 or newer; dependency versions pinned by `uv.lock`, taken current at project creation.
+- Python 3.14: `.python-version` holds `3.14`, `requires-python = ">=3.14,<3.15"`, the image is based on `python:3.14-slim`. Dependency versions pinned by `uv.lock`, taken current at project creation.
 - `float` is never used for money, in code or tests.
 - Columns and types of `firms` and `payments` are exactly those in spec section 7.1.
 - `INT32_MAX = 2_147_483_647` is the bound for every amount, batch total and balance.
@@ -23,14 +23,15 @@
 - No firm row is read before the locking query.
 - Tests run against real PostgreSQL only. The schema under test is created by `alembic upgrade head`, never by `metadata.create_all`.
 - Defaults: `MAX_PAYMENTS_PER_REQUEST=1000`, `MAX_DESCRIPTION_LENGTH=500`, `LOCK_TIMEOUT_MS=5000`, `DB_POOL_SIZE=10`, `DB_POOL_TIMEOUT_S=5`.
-- The run stand has four services: `db`, `migrate` (one-shot), `app` (three replicas, one Uvicorn process each, no published port) and `lb` (nginx, published on host port 8000). Replicas never run migrations.
+- The run stand has four services: `db` (published on `127.0.0.1:5432` for host-side tests), `migrate` (one-shot), `app` (three replicas, one Uvicorn process each, no published port) and `lb` (nginx, published on host port 8000). Replicas never run migrations.
+- The local container runtime is Podman 5.8 behind the `docker` command, with Docker Compose v5.1 as the compose provider (spec section 13.8). Write the Compose file for Docker Engine; if Podman behaves differently, report it with evidence instead of working around it.
 - `app/api.py` contains no SQL; `app/service.py` imports nothing from FastAPI.
 - Code, comments, commit messages and README are in English. One logical change per commit.
 - If the spec is contradictory, incomplete or looks wrong: stop and report. Do not fix it silently.
 
 ## Spec Revision
 
-This plan implements revision 3 of the spec. The spec already contains the rules found while planning (no U+0000 in descriptions, the key character set, the 11-character cap on amounts, the thread limit, the `JSON` column type), the results of the design probes (section 17), the run stand (section 5.6) and the justified batch limit (section 5.7). Nothing in this plan overrides the spec.
+This plan implements revision 4 of the spec. The spec already contains the rules found while planning (no U+0000 in descriptions, the key character set, the 11-character cap on amounts, the thread limit, the `JSON` column type), the results of the design probes (section 17), the run stand (section 5.6) and the justified batch limit (section 5.7). Revision 4 adds the page-3 request as a second sample (test A16, `make reset`), the published database port, the pinned Python version and the note on the local Podman runtime. Nothing in this plan overrides the spec.
 
 ## Review Focus
 
@@ -60,6 +61,9 @@ Inputs the spec implies but its test tables do not exercise, most likely first. 
 | `scripts/init-test-db.sql` | `CREATE DATABASE firm_payments_test;` for the compose database |
 | `deploy/nginx.conf` | Balancer: one upstream `app:8000`, headers `X-Upstream` and `X-Request-Id` |
 | `sample-request.json` | The request on page 4 of the task, verbatim |
+| `format-example-request.json` | The request on page 3 of the task, verbatim (without the comments) |
+| `Makefile` | `up`, `seed`, `reset`, `test`, `lint`, `check`, `load` |
+| `.python-version` | `3.14` |
 | `scripts/load.py` | Load scenarios L1 |
 | `tests/conftest.py` | Migration, cleanup, shared helpers and constants |
 | `tests/unit/`, `tests/db/`, `tests/api/`, `tests/concurrency/` | Tests by level |
@@ -67,19 +71,23 @@ Inputs the spec implies but its test tables do not exercise, most likely first. 
 
 ## Task Ownership
 
-| Tasks | Agent workflow step | Model |
+Tasks 1–8 run in one controller session under superpowers:subagent-driven-development: a fresh implementer subagent per task, a task reviewer after each, and a whole-branch review at the end. Every dispatch names its model explicitly.
+
+| Tasks | Agent workflow step | Implementer model |
 |---|---|---|
 | 1–2 | Step 2, scaffold | Sonnet 5.5 |
 | 3–6 | Step 3, core | Opus 5.5 |
 | 7–8 | Step 4, concurrency and load | Opus 5.5 |
-| 9 | Steps 5–6, review and README | Fable 5.2 in a new session; the author |
+| — | Whole-branch review after Task 8 | Fable 5.2 |
+| 9 | Steps 5–6, independent review and README | Fable 5.2 in a new session; the author |
 
 ---
 
 ### Task 1: Runnable skeleton and test harness
 
 **Files:**
-- Create: `pyproject.toml`, `uv.lock`, `.gitignore`, `Dockerfile`, `docker-compose.yml`, `Makefile`, `.github/workflows/ci.yml`, `scripts/init-test-db.sql`, `deploy/nginx.conf`, `ai-logs/.gitkeep`
+- Create: `pyproject.toml`, `uv.lock`, `.python-version`, `Dockerfile`, `docker-compose.yml`, `Makefile`, `.github/workflows/ci.yml`, `scripts/init-test-db.sql`, `deploy/nginx.conf`, `ai-logs/.gitkeep`
+- Modify: `.gitignore` (already exists: it ignores the task statement files, Python caches and `.superpowers/`; keep those entries)
 - Create: `app/__init__.py`, `app/config.py`, `app/db.py`, `app/api.py`, `app/main.py`
 - Test: `tests/conftest.py`, `tests/api/test_healthz.py`
 
@@ -110,12 +118,12 @@ def test_healthz_reports_ok(client):
   - `GET /healthz` runs `SELECT 1`; returns `{"status": "ok"}`, or 503 `{"status": "unavailable"}` if the query fails.
   - Lifespan sets the AnyIO default thread limiter's `total_tokens` to `settings.db_pool_size` (spec section 10). This works only from the event loop; calling the limiter from a worker thread raises.
   - Compose services (spec section 5.6):
-    - `db`: `postgres:18`, mounts `scripts/init-test-db.sql` into `/docker-entrypoint-initdb.d/`, healthcheck with `pg_isready`.
+    - `db`: `postgres:18`, mounts `scripts/init-test-db.sql` into `/docker-entrypoint-initdb.d/`, healthcheck with `pg_isready`, publishes `127.0.0.1:5432:5432` so that `uv run pytest` on the host reaches it.
     - `app`: `deploy.replicas: 3`; command `uvicorn app.main:app --host 0.0.0.0 --port 8000` (one process per replica); no `ports`; waits for `db` healthy; healthcheck `python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"`.
     - `lb`: `nginx:stable`, mounts `deploy/nginx.conf`, publishes `8000:80`, waits for `app` healthy.
     - The `migrate` service arrives in Task 2.
   - `deploy/nginx.conf`: an `upstream` whose single entry is `server app:8000;` (the name resolves to all replicas). In `location /`: `proxy_pass` to that upstream, `proxy_connect_timeout 2s`, `proxy_set_header X-Request-Id $request_id`, `add_header X-Upstream $upstream_addr always`. Leave `proxy_next_upstream` at its default: it does not re-send a `POST` that was already sent to a replica.
-  - The image installs with `uv sync --frozen`, dev dependencies included, so tests run in it.
+  - The image is based on `python:3.14-slim` and installs with `uv sync --frozen`, dev dependencies included, so tests run in it.
   - `make test` runs `docker compose run --rm -e TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@db:5432/firm_payments_test app pytest`; `make lint` runs `ruff check .`, `ruff format --check .`, `mypy app`; `make check` runs both.
   - CI workflow: check out, `docker compose up -d db`, `make check`.
 
@@ -127,7 +135,7 @@ def test_healthz_reports_ok(client):
 for i in $(seq 30); do curl -s -o /dev/null -D - localhost:8000/healthz | grep -i '^x-upstream'; done | sort | uniq -c
 ```
 
-Expected: exactly three distinct addresses. If the installed Compose does not honour `deploy.replicas` (fewer than three `app` containers), stop and report. Then `make check`. Expected: exit code 0.
+Expected: exactly three distinct addresses. The local runtime is Podman (Global Constraints). If it does not honour `deploy.replicas` (fewer than three `app` containers), if the name `app` does not resolve to every replica, or if `--wait` misbehaves, stop and report with the command output. Then `make check`. Expected: exit code 0.
 
 - [ ] **Step 6: Commit.** `git commit -m "chore: project skeleton, compose, healthz and test harness"`
 
@@ -136,8 +144,8 @@ Expected: exactly three distinct addresses. If the installed Compose does not ho
 ### Task 2: Database schema
 
 **Files:**
-- Create: `alembic.ini`, `migrations/env.py`, `migrations/versions/0001_initial.py`, `app/models.py`, `scripts/seed.sql`, `sample-request.json`
-- Modify: `tests/conftest.py`, `docker-compose.yml` (add the `migrate` service)
+- Create: `alembic.ini`, `migrations/env.py`, `migrations/versions/0001_initial.py`, `app/models.py`, `scripts/seed.sql`, `sample-request.json`, `format-example-request.json`
+- Modify: `tests/conftest.py`, `docker-compose.yml` (add the `migrate` service), `Makefile` (add `reset`)
 - Test: `tests/db/test_schema.py`
 
 **Interfaces:**
@@ -145,14 +153,15 @@ Expected: exactly three distinct addresses. If the installed Compose does not ho
 - Produces:
   - `app.models.Base`, `Firm` (`id`, `name`, `balance_cents`, `uuid`), `Payment` (`id`, `payer_firm_id`, `payee_firm_id`, `amount_cents`, `description`), `IdempotencyKey` (`id`, `payer_firm_uuid`, `key`, `request_hash`, `response_body`, `created_at`); table names `firms`, `payments`, `idempotency_keys`.
   - In `tests/conftest.py`:
-    - constants `PINECREST = "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41"`, `LOPEZ = "8b2e4c71-0d3a-4f6e-b1c9-5a7d2e9f4c10"`, `NAIR = "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25"`, and `SAMPLE_REQUEST` (loaded from `sample-request.json`, which holds the request on page 4 of the task verbatim);
+    - constants `PINECREST = "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41"`, `LOPEZ = "8b2e4c71-0d3a-4f6e-b1c9-5a7d2e9f4c10"`, `NAIR = "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25"`, `SAMPLE_REQUEST` (loaded from `sample-request.json`, which holds the request on page 4 of the task verbatim) and `FORMAT_EXAMPLE_REQUEST` (loaded from `format-example-request.json`, which holds the request on page 3 of the task verbatim, without its comments: Pinecrest pays Lopez `"1200.75"` with description `"Bookkeeping cleanup, 3 clients"` and Nair `"300"` with description `"Referral fee, 2 clients"`);
     - fixture `db -> Session`;
     - `balances(db) -> dict[str, int]` (uuid to cents, all firms);
     - `payment_rows(db) -> list[tuple[int, int, int, str]]` (payer id, payee id, cents, description; ordered by `id`);
     - `add_firm(db, firm_id: int, balance_cents: int) -> str` (returns a new lowercase UUID);
     - `set_balance(db, uuid: str, balance_cents: int) -> None`;
     - `bulk(payer: str, *payments: tuple[str, str]) -> dict` (builds a request body from `(payee_uuid, amount)` pairs, description `"p{i}"`).
-  - Session-scoped autouse fixture runs `alembic upgrade head`; function-scoped autouse fixture runs `TRUNCATE payments, idempotency_keys, firms RESTART IDENTITY CASCADE` and then executes `scripts/seed.sql`.
+  - A session-scoped fixture runs `alembic upgrade head`; a function-scoped fixture runs `TRUNCATE payments, idempotency_keys, firms RESTART IDENTITY CASCADE` and then executes `scripts/seed.sql`. Both apply automatically to every test outside `tests/unit/`; tests under `tests/unit/` never touch the database and pass with no database running.
+  - Make target `reset`: the same `TRUNCATE` followed by `scripts/seed.sql`, against the application database through `docker compose exec -T db psql`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -185,7 +194,7 @@ def test_migration_round_trip():
 
 - [ ] **Step 4: Run the tests.** Expected: PASS, including Task 1's test.
 
-- [ ] **Step 5: Verify the migration and seed path.** `docker compose up --build -d --wait`, then `docker compose ps -a`. Expected: `migrate` exited with code 0, three `app` containers healthy. Then `make seed` and `docker compose exec -T db psql -U postgres -d firm_payments -c "SELECT id, balance_cents FROM firms ORDER BY id"`. Expected: three rows with 5000000, 50000, 200000.
+- [ ] **Step 5: Verify the migration and seed path.** `docker compose up --build -d --wait`, then `docker compose ps -a`. Expected: `migrate` exited with code 0, three `app` containers healthy. Then `make seed` and `docker compose exec -T db psql -U postgres -d firm_payments -c "SELECT id, balance_cents FROM firms ORDER BY id"`. Expected: three rows with 5000000, 50000, 200000. Then `make seed` again (expected: fails on the duplicate key, which is why `reset` exists), `make reset`, and the same `SELECT`. Expected: the same three rows.
 
 - [ ] **Step 6: Commit.** `git commit -m "feat: schema migration, ORM models and seed"`
 
@@ -363,6 +372,7 @@ def assert_rejected(r, code, db, before):
 | `test_a11_balance_overflow` | `set_balance(db, NAIR, INT32_MAX)`; Pinecrest pays Nair `"0.01"` | rejected, `balance_overflow` |
 | `test_a13_response_order` | Pinecrest pays Lopez `"3"`, Nair `"1"`, Lopez `"2"` | response amounts `["3.00", "1.00", "2.00"]` |
 | `test_response_has_no_balance` | `SAMPLE_REQUEST` | no key containing `balance` anywhere in the body |
+| `test_a16_format_example_request` | `FORMAT_EXAMPLE_REQUEST` | 201; `total_amount` `"1500.75"`; balances `{PINECREST: 4_849_925, LOPEZ: 170_075, NAIR: 230_000}`; two rows in `payments` |
 
 In `tests/api/test_validation.py`:
 
@@ -536,7 +546,7 @@ Owner: the author, with an independent review in a new session (agent workflow s
 
 - [ ] **Step 1: Independent review.** Run the step 5 prompt from the agent work plan in a new session that has only the repository. Triage every finding: fix, or record in the README why not.
 
-- [ ] **Step 2: Write the README** as a pull request description: solution and approach, issues encountered, assumptions (spec section 4), possible improvements (spec section 15), how to run and verify, AI tools used and where each fit, answers to the two questions. Take measured facts from `docs/verification-notes.md`. The run section names the prerequisites (Docker with Compose; `make` optional), gives the plain `docker compose` command behind every `make` target, and states the endpoint as `POST http://localhost:8000/bulk-payments`.
+- [ ] **Step 2: Write the README** as a pull request description: solution and approach, issues encountered, assumptions (spec section 4), possible improvements (spec section 15), how to run and verify, AI tools used and where each fit, answers to the two questions. Take measured facts from `docs/verification-notes.md`. The run section names the prerequisites (Docker with Compose; `make` optional), gives the plain `docker compose` command behind every `make` target, states the endpoint as `POST http://localhost:8000/bulk-payments`, shows both sample requests (`sample-request.json`, `format-example-request.json`) with their expected balances, and says where the stand was verified (Podman locally, Docker Engine in CI). The AI section lists every session in `ai-logs/` with its tool and model, and states that the account email and home directory path were masked and nothing else was changed, and that aborted early attempts are not included (spec section 14.3).
 
 - [ ] **Step 3: Acceptance run on a clean clone**, following only the README (spec section 14.2):
 
@@ -548,9 +558,9 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8000/bulk-payments \
   -H "Content-Type: application/json" -d @sample-request.json
 ```
 
-Expected: `201`; balances 3674875, 170075, 1405050. Repeat the `curl` three more times. Expected: `201`, `201`, `422`. Then `make check`. Expected: exit code 0. Finally repeat the upstream count from Task 1, Step 5. Expected: three distinct addresses.
+Expected: `201`; balances 3674875, 170075, 1405050. Repeat the `curl` three more times. Expected: `201`, `201`, `422`. Then `make reset` and the same `curl` with `-d @format-example-request.json`. Expected: `201`; balances 4849925, 170075, 230000. Then `make check`. Expected: exit code 0. Finally repeat the upstream count from Task 1, Step 5. Expected: three distinct addresses.
 
-`sample-request.json` was committed in Task 2.
+`sample-request.json` and `format-example-request.json` were committed in Task 2.
 
 - [ ] **Step 4: Submission checklist** (spec section 14.3): commit history shows the progress; `ai-logs/` is complete and unedited; README sections are all present; assumptions and improvements match the spec.
 
@@ -565,7 +575,7 @@ Expected: `201`; balances 3674875, 170075, 1405050. Repeat the `curl` three more
 | Sections 6, 10, 11, 12 (stack, configuration, layout, healthz) | 1 |
 | Section 7 (schema) | 2 |
 | Section 8.1 validation rules; tests U1–U5 | 3, 4 |
-| Section 8.1 responses; section 8.2 steps 1, 3–8, 10; tests A1–A13 | 5 |
+| Section 8.1 responses; section 8.2 steps 1, 3–8, 10; tests A1–A16 | 5 |
 | Section 8.2 steps 2 and 9; tests I1–I4, I6–I8 | 6 |
 | Section 9 invariants; tests C1–C6, I5 | 7 |
 | Tests C7, L1 | 8 |
@@ -583,6 +593,7 @@ Spec test ids without an id in a test name:
 |---|---|
 | A14 | `test_non_object_bodies` |
 | A15 | `test_response_has_no_balance` |
+| A16 | `test_a16_format_example_request` |
 | I9 | `test_invalid_idempotency_key` (unit), `test_invalid_key_header` (HTTP) |
 | C7 | `test_c7_one_payer_over_http`, `test_c7_crossing_over_http`, `test_c7_same_key_over_http` |
 | C8 | `test_key_wait_respects_lock_timeout` |

@@ -45,6 +45,7 @@ Tasks 1–8 and the whole-branch review ran on 2026-11-24 on branch `feat/bulk-p
 - The whole-branch review led to a fix wave: a 422 message naming `Content-Type: application/json` when the body is not sent as JSON; host ports `DB_PORT` and `LB_PORT`, with the balancer bound to `127.0.0.1`; nginx `client_max_body_size 8m` and `Host` forwarding; a CI job `stand` that runs the stand on Docker Engine.
 - `make test`, `make lint` and `make load` run on the host through `uv run` (the author's decision). Task 1 originally ran them in a one-off `app` container. The recorded load runs used the in-container command.
 - Function and method signatures in `app/`, `scripts/` and `migrations/` are fully typed under mypy strict, and ruff requires docstrings on them. The largest test helpers and tests have them as well.
+- At the author's request, each replica checks at startup that `alembic_version` equals the migration head and exits otherwise (`app/schema_revision.py`, commit 90940af).
 - The README was drafted in the controller session at the author's request; the independent review (Task 9, Step 1) is still to run.
 
 ## Review Focus

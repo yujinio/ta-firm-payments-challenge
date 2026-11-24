@@ -85,7 +85,7 @@ The service runs as several instances behind a load balancer and uses a relation
 | **Additive extension** | Optional `Idempotency-Key` header and a service table; the given tables and examples work unchanged | **[R] Chosen** |
 | Changing the given tables | `BIGINT`, `batch_id`, `created_at`, `CHECK` | Rejected: changes the columns and types the task gives for `firms` and `payments` |
 
-Rationale [R]: the task does not forbid extension, and without a key duplicates cannot be prevented. The task describes the platform's database as two tables; the chosen option keeps both exactly as given and adds a service table, `idempotency_keys`, next to them. The service writes to it only when a request carries the `Idempotency-Key` header, so a request made strictly as the task describes touches only the two given tables.
+Rationale [R]: the purpose of the extension is to exclude duplicate operations. A client that loses the response after a commit, to a timeout, a dropped connection or a crash, cannot tell whether its payments went through, and a plain retry creates a second batch. The server cannot tell a retry from a legitimate second batch (assumption 6), so only a key sent by the client can prevent the duplicate. This is a feature beyond what the task asks for: the task does not forbid extension, and without a key duplicates cannot be prevented. The task describes the platform's database as two tables; the chosen option keeps both exactly as given and adds a service table, `idempotency_keys`, next to them. The service writes to it only when a request carries the `Idempotency-Key` header, so a request made strictly as the task describes touches only the two given tables.
 
 ### 5.2. Where to store the idempotency key
 
@@ -146,8 +146,9 @@ The number is a property of the stand, not a capacity recommendation.
 **Consequences of the stand:**
 
 - Migrations run once, in a separate `migrate` service that the replicas wait for. Three replicas each running `alembic upgrade head` at start would race.
+- Before serving, each replica checks that the revision in `alembic_version` equals the head revision of the migrations in its image, and refuses to start if they differ. A replica never serves against a schema it was not built for, for example after a failed migration or when a newer image meets an older database.
 - Each replica is a single Uvicorn process. Replicas publish no host port. The balancer publishes `127.0.0.1:${LB_PORT:-8000}`; `db` publishes `127.0.0.1:${DB_PORT:-5432}` so that tests and the multi-process test server can run on the host. Both bind to the loopback interface: the API has no authentication. The variables let a machine that already runs PostgreSQL or uses port 8000 choose other ports.
-- The balancer accepts bodies up to 8 MB (`client_max_body_size`); nginx's 1 MB default is below the largest valid request (1,000 payments with 500-character non-ASCII descriptions, about 1.1 MB). It forwards the client's `Host` header, so redirects keep the published port.
+- The balancer accepts bodies up to 8 MB (`client_max_body_size`). nginx's 1 MB default is below valid requests: 1,000 payments with 500-character descriptions take about 1.1 MB with two-byte characters and up to about 6.1 MB when every character is a `\u` escape. It forwards the client's `Host` header, so redirects keep the published port.
 - nginx does not pass a `POST` to another replica once it has been sent to one, so the balancer never duplicates a payment by itself. A request that could not be delivered at all is passed to the next replica. Retrying after a lost response stays the client's job, with an idempotency key.
 - nginx resolves the replica addresses when it starts. After replicas are recreated or rescaled, the balancer must be restarted.
 - The balancer adds the response header `X-Upstream` with the address of the replica that served the request, so the distribution can be observed (check S2).
@@ -452,6 +453,7 @@ app/
   idempotency.py   key handling
   models.py        ORM models
   db.py            engine, session factory
+  schema_revision.py  startup check: alembic_version equals the migration head
   config.py        settings
   errors.py        domain errors and their codes
 migrations/        Alembic
@@ -569,6 +571,7 @@ Scenario C7 models multiple instances: Uvicorn processes do not share memory and
 
 - `ruff check`, `ruff format --check`, `mypy` with no errors.
 - Migrations apply to an empty database and roll back.
+- The application refuses to start when the database is not at the migration head.
 - All checks run with one command and in CI.
 
 ### 13.7. Mutation check of the concurrency tests

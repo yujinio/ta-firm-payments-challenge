@@ -18,7 +18,10 @@ class ErrorPayload(TypedDict):
 
 
 class ErrorBody(TypedDict):
-    """The JSON body of every error response the service writes."""
+    """The JSON body of every error response from the API's handlers.
+
+    /healthz is the exception: it answers 503 with {"status": "unavailable"}.
+    """
 
     error: ErrorPayload
 

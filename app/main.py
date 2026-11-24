@@ -98,6 +98,7 @@ async def log_request(
         return response
     finally:
         state = request.state
+        # request.state is untyped: these getattr values are Any at this boundary.
         total_cents = getattr(state, "total_cents", None)
         record: RequestLogRecord = {
             "request_id": request_id,

@@ -4,9 +4,11 @@ import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
+# On the host the default follows DB_PORT, the port docker-compose.yml publishes `db` on.
 os.environ["DATABASE_URL"] = os.environ.get(
     "TEST_DATABASE_URL",
-    "postgresql+psycopg://postgres:postgres@localhost:5432/firm_payments_test",
+    "postgresql+psycopg://postgres:postgres@localhost:"
+    f"{os.environ.get('DB_PORT') or '5432'}/firm_payments_test",
 )
 
 import pytest  # noqa: E402

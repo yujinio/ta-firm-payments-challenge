@@ -1,3 +1,4 @@
+# Inside the Compose network db listens on 5432, whatever DB_PORT publishes on the host.
 TEST_DB_URL = postgresql+psycopg://postgres:postgres@db:5432/firm_payments_test
 LOAD_DB_URL = postgresql+psycopg://postgres:postgres@db:5432/firm_payments
 # make load ARGS="--scenario hot-payer --requests 2000 --concurrency 32"

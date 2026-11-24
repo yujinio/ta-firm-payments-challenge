@@ -86,12 +86,13 @@ clean.
 - Plan of the M2 lock query (`... WHERE firms.uuid IN (...) FOR NO KEY UPDATE`): `LockRows` over
   `Bitmap Heap Scan on firms` over `Bitmap Index Scan on uq_firms_uuid`.
   - C2: in all 1,000 lock queries.
-  - C3: in all 171 that completed. The others failed with a deadlock (21 in this run).
+  - C3: in all 171 captured. The container log dropped about 6% of the statements in this run,
+    so 171 is not the number of lock queries C3 ran.
 - Row versions of `firms`, from `pg_stat_user_tables`:
   - C2 under M2: 2,000 updates, of which 1,969 were HOT and 31 went to a new page.
   - The following C3 run under M2: 345 updates, 328 HOT and 17 to a new page.
-- In C3, the deadlock reports name tuples on page 1 of `firms`, for example `(1,7)` and `(1,2)`,
-  so some rows had moved off page 0.
+- In C3, the deadlock reports name tuples on page 1 of `firms`, for example `(1,7)` and `(1,2)`.
+  Inferred from these tuple ids, not observed directly: some rows had moved off page 0.
 - The ORM sends a transaction's balance updates as one executemany in primary-key order. A
   request from Nair (id 3) to Pinecrest (id 1) and Lopez (id 2) updates ids 1, 2, 3 in that order.
 
@@ -272,6 +273,16 @@ How the figures were taken:
   through nginx.
 - Percentiles are nearest-rank.
 
+**A change to `scripts/load.py` after the runs.** After the runs above, one timing line in
+`send()` was moved: the end-of-request timestamp is now taken before the HTTP client is returned
+to the pool, and was taken after it before. The old timed region therefore also contained one
+`SimpleQueue.put` on an unbounded queue, which never blocks; `timeit` puts the call at about
+10 ns on the host. It could lengthen a client duration by that much, which is far below the
+0.1 ms the figures are given to, so it cannot change any recorded figure. Wall time and
+requests/s are timed outside `send()`, and the statuses, `X-Upstream` counts, ledger checks and
+server `duration_ms` values do not pass through that line. The runs were not repeated after the
+edit.
+
 Results common to all five runs:
 
 - No run had a 503, a 500 or a request without a response.
@@ -299,6 +310,10 @@ this machine through the balancer, one payer handled 619 batches per second and 
 |---|---|---|---|---|
 | 40 requests, concurrency 4 (planned) | 196.0 | 257.6 | 190.6 | 256.4 |
 | 40 requests, concurrency 1 (supplementary) | 50.3 | 69.9 | 49.2 | 68.8 |
+
+The client medians here are `statistics.median`, the mean of the 20th and 21st of the 40 sorted
+durations. The p50 in the table above is nearest-rank, the 20th. So 193.2 ms there and 196.0 ms
+here are the same run under the two definitions, as are 50.2 ms and 50.3 ms.
 
 The server values come from `duration_ms` in the replicas' request log records, taken from
 `docker compose logs app` and filtered by the run's payer. `duration_ms` runs from the request

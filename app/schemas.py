@@ -1,4 +1,8 @@
 import re
+from typing import Annotated
+from uuid import UUID
+
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictStr
 
 INT32_MAX = 2_147_483_647
 
@@ -24,3 +28,38 @@ def parse_amount_cents(value: str) -> int:
 def format_cents(cents: int) -> str:
     """Render non-negative integer cents as a decimal string with exactly two decimals."""
     return f"{cents // 100}.{cents % 100:02d}"
+
+
+def _check_amount(value: str) -> str:
+    parse_amount_cents(value)
+    return value
+
+
+def _check_description(value: str) -> str:
+    # PostgreSQL TEXT cannot store U+0000.
+    if "\x00" in value:
+        raise ValueError("description must not contain the character U+0000")
+    # A lone surrogate (from a JSON escape such as \ud800) cannot be encoded
+    # for the request hash or the database.
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("description must not contain unpaired surrogates") from None
+    return value
+
+
+class PaymentIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    amount: Annotated[StrictStr, AfterValidator(_check_amount)]
+    payee_firm_uuid: UUID
+    description: Annotated[StrictStr, AfterValidator(_check_description)]
+
+
+class BulkPaymentRequest(BaseModel):
+    """The request body; limits that depend on settings are checked in build_command."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    payer_firm_uuid: UUID
+    payments: Annotated[list[PaymentIn], Field(min_length=1)]

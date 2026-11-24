@@ -278,10 +278,10 @@ How the figures were taken:
 to the pool, and was taken after it before. The old timed region therefore also contained one
 `SimpleQueue.put` on an unbounded queue, which never blocks; `timeit` puts the call at about
 10 ns on the host. It could lengthen a client duration by that much, which is far below the
-0.1 ms the figures are given to, so it cannot change any recorded figure. Wall time and
-requests/s are timed outside `send()`, and the statuses, `X-Upstream` counts, ledger checks and
-server `duration_ms` values do not pass through that line. The runs were not repeated after the
-edit.
+0.1 ms the figures are given to, so it cannot change any recorded figure. The edit moved only
+where the per-request clock is read; every request still does the same work, so wall time and
+requests/s are unaffected. The statuses, `X-Upstream` counts, ledger checks and server
+`duration_ms` values do not pass through that line. The runs were not repeated after the edit.
 
 Results common to all five runs:
 

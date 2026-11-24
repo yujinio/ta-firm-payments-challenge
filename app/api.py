@@ -38,9 +38,13 @@ def create_bulk_payment(
     # Fields for the per-request log record written in app.main.
     request.state.payer = str(payload.payer_firm_uuid)
     request.state.payment_count = len(payload.payments)
-    command = build_command(payload, None, settings)
+    # Spec 8.1: if the header is sent more than once, the first value is used.
+    keys = request.headers.getlist("Idempotency-Key")
+    command = build_command(payload, keys[0] if keys else None, settings)
     request.state.total_cents = command.total_cents
 
     result = execute_bulk_payment(session, command, settings.lock_timeout_ms)
     request.state.outcome = "replayed" if result.replayed else "created"
-    return JSONResponse(result.body, status_code=201)
+    # The original and the replay are serialized the same way, so the bytes match.
+    headers = {"Idempotent-Replayed": "true"} if result.replayed else None
+    return JSONResponse(result.body, status_code=201, headers=headers)

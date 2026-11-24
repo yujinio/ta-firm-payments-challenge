@@ -17,7 +17,7 @@ from app.errors import (
     ServiceBusy,
     ValidationFailed,
 )
-from app.idempotency import compute_request_hash
+from app.idempotency import claim_key, compute_request_hash, store_response
 from app.models import Firm, Payment
 from app.schemas import INT32_MAX, BulkPaymentRequest, format_cents, parse_amount_cents
 
@@ -136,7 +136,7 @@ def execute_bulk_payment(
     """
     try:
         with session.begin():
-            body = _apply(session, command, lock_timeout_ms)
+            result = _apply(session, command, lock_timeout_ms)
     except DBAPIError as exc:
         sqlstate = getattr(exc.orig, "sqlstate", None)
         if sqlstate == _DEADLOCK_DETECTED:
@@ -149,15 +149,26 @@ def execute_bulk_payment(
         raise
     except PoolTimeoutError as exc:
         raise ServiceBusy("no database connection is available; retry") from exc
-    return BulkPaymentResult(body=body, replayed=False)
+    return result
 
 
-def _apply(session: Session, command: BulkPaymentCommand, lock_timeout_ms: int) -> dict[str, Any]:
+def _apply(
+    session: Session, command: BulkPaymentCommand, lock_timeout_ms: int
+) -> BulkPaymentResult:
     """Transaction steps of spec section 8.2; only database work happens here."""
     session.execute(
         text("SELECT set_config('lock_timeout', :value, true)"),
         {"value": f"{lock_timeout_ms}ms"},
     )
+
+    key = command.idempotency_key
+    if key is not None:
+        assert command.request_hash is not None  # build_command sets both or neither
+        # Claimed before any firm is read: a second request with this key waits
+        # here for the outcome of the first.
+        stored = claim_key(session, command.payer_uuid, key, command.request_hash)
+        if stored is not None:
+            return BulkPaymentResult(body=stored, replayed=True)
 
     # The only read of firms: it finds, checks and locks them in one consistent order.
     locked = session.scalars(
@@ -197,7 +208,7 @@ def _apply(session: Session, command: BulkPaymentCommand, lock_timeout_ms: int) 
     for payee_uuid, credit in command.credits.items():
         firms[payee_uuid].balance_cents += credit
 
-    return {
+    body: dict[str, Any] = {
         "payer_firm_uuid": command.payer_uuid,
         "total_amount": format_cents(command.total_cents),
         "payments": [
@@ -210,3 +221,9 @@ def _apply(session: Session, command: BulkPaymentCommand, lock_timeout_ms: int) 
             for row, item in zip(rows, command.items, strict=True)
         ],
     }
+
+    if key is not None:
+        # Balance updates go out first, so storing the response is the last statement.
+        session.flush()
+        store_response(session, command.payer_uuid, key, body)
+    return BulkPaymentResult(body=body, replayed=False)

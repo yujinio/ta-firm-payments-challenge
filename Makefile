@@ -13,10 +13,10 @@ reset:
 		-c "TRUNCATE payments, idempotency_keys, firms RESTART IDENTITY CASCADE" -f - < scripts/seed.sql
 
 test:
-	docker compose run --rm -e TEST_DATABASE_URL=$(TEST_DB_URL) app pytest
+	docker compose run --rm --build -e TEST_DATABASE_URL=$(TEST_DB_URL) app pytest
 
 lint:
-	docker compose run --rm app sh -c "ruff check . && ruff format --check . && mypy app"
+	docker compose run --rm --build app sh -c "ruff check . && ruff format --check . && mypy app"
 
 check: test lint
 

@@ -1,0 +1,17 @@
+# OS
+.DS_Store
+
+# Task statement: copyrighted, kept locally only
+docs/TA Firm Payments.pdf
+docs/assignment.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Agent tooling scratch
+.superpowers/

@@ -1,6 +1,8 @@
-# Inside the Compose network db listens on 5432, whatever DB_PORT publishes on the host.
-TEST_DB_URL = postgresql+psycopg://postgres:postgres@db:5432/firm_payments_test
-LOAD_DB_URL = postgresql+psycopg://postgres:postgres@db:5432/firm_payments
+# Python tooling runs on the host through uv; the stand and its database run in Compose.
+# DB_PORT and LB_PORT match the host ports docker-compose.yml publishes.
+DB_PORT ?= 5432
+LB_PORT ?= 8000
+LOAD_DB_URL = postgresql+psycopg://postgres:postgres@localhost:$(DB_PORT)/firm_payments
 # make load ARGS="--scenario hot-payer --requests 2000 --concurrency 32"
 ARGS ?= --scenario uniform --requests 2000 --concurrency 32
 
@@ -19,16 +21,20 @@ reset:
 	docker compose exec -T db psql -U postgres -d firm_payments -v ON_ERROR_STOP=1 \
 		-c "TRUNCATE payments, idempotency_keys, firms RESTART IDENTITY CASCADE" -f - < scripts/seed.sql
 
+# The tests use the firm_payments_test database on localhost:$(DB_PORT) (tests/conftest.py).
 test:
-	docker compose run --rm --build -e TEST_DATABASE_URL=$(TEST_DB_URL) app pytest
+	docker compose up -d --wait db
+	uv run --locked pytest
 
 lint:
-	docker compose run --rm --build app sh -c "ruff check . && ruff format --check . && mypy app"
+	uv run --locked ruff check .
+	uv run --locked ruff format --check .
+	uv run --locked mypy app
 
 check: test lint
 
-# Inside the Compose network, through the balancer. The script adds firms with ids
-# from 1000 and payments between them; `make reset` returns to the seed.
+# Through the balancer's host port. The script adds firms with ids from 1000 and
+# payments between them; `make reset` returns to the seed.
 load:
-	docker compose run --rm --build app python scripts/load.py \
-		--base-url http://lb --database-url $(LOAD_DB_URL) $(ARGS)
+	uv run --locked python scripts/load.py \
+		--base-url http://localhost:$(LB_PORT) --database-url $(LOAD_DB_URL) $(ARGS)

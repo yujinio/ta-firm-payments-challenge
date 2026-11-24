@@ -232,7 +232,7 @@ shared the VM's 6 CPUs.
 - Before the runs: `make up` (the stand includes commit 2639070), then S1 and S2 below.
 - After the runs: `make reset`.
 
-`make load` runs:
+At the time of these runs `make load` ran:
 
 ```
 docker compose run --rm --build app python scripts/load.py \
@@ -251,6 +251,11 @@ make load ARGS="--scenario max-batch --requests 40 --concurrency 1"
 ```
 
 The last run is supplementary: it measures the maximal batch without lock contention.
+
+`make load` has since moved to the host (`uv run python scripts/load.py --base-url
+http://localhost:8000 ...`). From the host every request also crosses the runtime's port
+forwarding into the VM, so figures from the current target are not comparable with the ones
+below.
 
 **What each run does.** Before every run the script:
 

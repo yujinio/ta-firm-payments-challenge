@@ -1,4 +1,7 @@
 TEST_DB_URL = postgresql+psycopg://postgres:postgres@db:5432/firm_payments_test
+LOAD_DB_URL = postgresql+psycopg://postgres:postgres@db:5432/firm_payments
+# make load ARGS="--scenario hot-payer --requests 2000 --concurrency 32"
+ARGS ?= --scenario uniform --requests 2000 --concurrency 32
 
 .PHONY: up seed reset test lint check load
 
@@ -23,5 +26,8 @@ lint:
 
 check: test lint
 
+# Inside the Compose network, through the balancer. The script adds firms with ids
+# from 1000 and payments between them; `make reset` returns to the seed.
 load:
-	uv run python scripts/load.py
+	docker compose run --rm --build app python scripts/load.py \
+		--base-url http://lb --database-url $(LOAD_DB_URL) $(ARGS)

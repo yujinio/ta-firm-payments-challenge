@@ -158,3 +158,242 @@ These are the five claims at the end of spec section 17.
 Also observed: with the only pooled connection checked out, `execute_bulk_payment` raises
 `ServiceBusy` whose cause is `sqlalchemy.exc.TimeoutError` (`test_pool_exhaustion_is_busy`,
 C9). This matches the spec 17 note that pool exhaustion is not a `DBAPIError`.
+
+## Multi-process concurrency (C7)
+
+`tests/concurrency/test_multiprocess.py` starts `uvicorn app.main:app --workers 4` on a free
+port against the test database (fixture `live_server`). The fixture treats the server as ready
+once `/healthz` answers 200 and all four workers have logged `Application startup complete.`.
+Each thread posts with its own `httpx2.Client`. The processes share no memory, so they
+coordinate only through the database.
+
+| Test | Result |
+|---|---|
+| `test_c7_one_payer_over_http` | 10 parallel batches of 300.00 from a firm holding 1,000.00 gave three 201 and seven 422 `insufficient_funds`. 100.00 is left and the ledger is consistent. |
+| `test_c7_same_key_over_http` | 8 parallel posts of the sample request with one key all returned 201. Exactly one lacked `Idempotent-Replayed`, and the eight bodies were byte-identical. 3 payment rows; Pinecrest 3 674 875. |
+| `test_c7_crossing_over_http` | 10 rounds of 50 (25 A→B and 25 B→A, `"1"` each): every response was 201 with no 503. A and B were unchanged after every round and the ledger stayed consistent. |
+
+The module passed five runs in a row, 1.8 to 1.9 s each. The whole suite now has 145 tests.
+
+### Connections per process
+
+While C7 ran, `lsof` showed how many database connections each worker held: 11, 10, 9 and 11.
+That is 41 connections against 4 × `DB_POOL_SIZE` = 40.
+
+The cause: when a worker's first requests arrived concurrently, each built its own engine,
+because `functools.lru_cache` does not make `get_engine` run only once. A single worker with no
+warm-up request showed the extra connections staying open:
+
+- After two bursts of 10 concurrent requests it held 19 connections.
+- After 10 s idle it still held 19.
+
+Commit 2639070 fixed this. The engine is now built under a lock, and the lifespan builds it
+before the first request. After the fix:
+
+- The same single worker held 10 connections.
+- The C7 workers held 10, 6, 9 and 10.
+- After the load runs below, each stand replica held exactly 10 (`pg_stat_activity` grouped by
+  client address).
+
+Connection budget during `make test` (`max_connections` 100):
+
+| Holder | Connections |
+|---|---|
+| Stand, when running | at most 30 |
+| Test process's own engine | 10 |
+| `live_server` | at most 40 |
+| In-process concurrency engine | at most 50 |
+
+`live_server` and the in-process concurrency engine never hold connections at the same time:
+
+- The concurrency engine is disposed at the end of each module and again before `live_server`
+  starts.
+- `live_server` is stopped at the end of its module.
+
+The peak is therefore 80 while `live_server` runs and 90 during the in-process concurrency
+modules.
+
+## Load run
+
+All runs were made on 2026-11-24.
+
+**Machine.** The host is an Apple M4 Pro (12 cores, 48 GiB memory) running macOS 26.6.2. The
+stand runs in the Podman 5.8.2 machine (applehv, rootful, Fedora 43 arm64), which has 6 CPUs and
+3.7 GiB (3,814 MiB) of memory.
+
+**Versions.** Docker Compose v5.1.3, PostgreSQL 18.6, nginx 1.30.8, Python 3.14.10, Uvicorn
+0.54.0, httpx2 2.16.2.
+
+**Setup.** The load script ran in a one-off `app` container inside the Compose network and
+posted to `http://lb`. The client, the balancer, the three replicas and the database therefore
+shared the VM's 6 CPUs.
+
+- Before the runs: `make up` (the stand includes commit 2639070), then S1 and S2 below.
+- After the runs: `make reset`.
+
+`make load` runs:
+
+```
+docker compose run --rm --build app python scripts/load.py \
+    --base-url http://lb \
+    --database-url postgresql+psycopg://postgres:postgres@db:5432/firm_payments $(ARGS)
+```
+
+The runs, in order:
+
+```
+make load ARGS="--scenario uniform --requests 2000 --concurrency 32"
+make load ARGS="--scenario hot-payer --requests 2000 --concurrency 32"
+make load ARGS="--scenario hot-payee --requests 2000 --concurrency 32"
+make load ARGS="--scenario max-batch --requests 40 --concurrency 4"
+make load ARGS="--scenario max-batch --requests 40 --concurrency 1"
+```
+
+The last run is supplementary: it measures the maximal batch without lock contention.
+
+**What each run does.** Before every run the script:
+
+- deletes the firms with ids from 1000 and their payments;
+- inserts 1,100 firms (ids 1000 to 2099) with 10,000,000.00 each.
+
+Batches other than max-batch carry three payments of 0.01 to 10.00 each.
+
+| Scenario | Requests / concurrency | Wall time, s | Requests/s | p50, ms | p95, ms | p99, ms | Max, ms | Statuses | Exit |
+|---|---|---|---|---|---|---|---|---|---|
+| uniform | 2000 / 32 | 1.930 | 1036.5 | 30.5 | 54.3 | 62.7 | 72.2 | 201: 2000 | 0 |
+| hot-payer | 2000 / 32 | 3.231 | 619.0 | 37.0 | 123.0 | 159.9 | 326.2 | 201: 2000 | 0 |
+| hot-payee | 2000 / 32 | 3.188 | 627.4 | 35.0 | 123.5 | 157.8 | 209.9 | 201: 2000 | 0 |
+| max-batch | 40 / 4 | 2.048 | 19.5 | 193.2 | 239.4 | 257.6 | 257.6 | 201: 40 | 0 |
+| max-batch (supplementary) | 40 / 1 | 2.204 | 18.1 | 50.2 | 69.6 | 69.9 | 69.9 | 201: 40 | 0 |
+
+How the figures were taken:
+
+- Durations are measured by the client, from sending the request to the end of the response,
+  through nginx.
+- Percentiles are nearest-rank.
+
+Results common to all five runs:
+
+- No run had a 503, a 500 or a request without a response.
+- `X-Upstream` split the requests evenly over the three replicas: 667/666/667, 666/666/668,
+  667/667/666, 13/14/13 and 14/13/13.
+
+After every run, every check of the script passed:
+
+- No balance was negative.
+- The sum of all balances stayed at 1,100,005,250,000 cents: the 1,100 load firms plus the seed.
+- Every load firm's balance equalled its start balance minus its payments plus its credits.
+- The payment rows equalled the 201 responses times the payments per request: 6,000 in each of
+  the first three runs and 40,000 in each max-batch run.
+
+I deliberately tampered with the database to check that the script reports a failure.
+During a separate host-side `uniform` run, a `psql` session added 1 cent to one load firm's
+balance. The script reported I-2 and the ledger check as FAIL and exited with 1.
+
+**Assumption 7.** It estimated hundreds of batches per second through one firm. Measured on
+this machine through the balancer, one payer handled 619 batches per second and one payee 627.
+
+### Maximal batch against the 250 ms budget (spec 5.7)
+
+| Run | Client median, ms | Client max, ms | Server median, ms | Server max, ms |
+|---|---|---|---|---|
+| 40 requests, concurrency 4 (planned) | 196.0 | 257.6 | 190.6 | 256.4 |
+| 40 requests, concurrency 1 (supplementary) | 50.3 | 69.9 | 49.2 | 68.8 |
+
+The server values come from `duration_ms` in the replicas' request log records, taken from
+`docker compose logs app` and filtered by the run's payer. `duration_ms` runs from the request
+entering the middleware to the response, lock waits included.
+
+**Planned run.** All 40 requests come from one payer, so they run one after another on its row
+lock. Each duration includes waiting behind up to three other maximal batches.
+
+- The median, 196.0 ms, is within the budget.
+- The maximum is over it: 257.6 ms at the client and 256.4 ms at the server, about 7 ms above
+  250 ms.
+
+**Supplementary run.** Without contention, a 1,000-payment request takes 50.3 ms median and
+69.9 ms at most, end to end. Locks are held only inside the transaction, which is part of the
+request. So these are upper bounds on how long a maximal batch holds its locks: about a quarter
+of the 250 ms budget.
+
+For comparison, the spec 5.7 probe measured 109 ms of lock hold and 126 ms for the whole
+transaction at 1,000 payments.
+
+**Decision.** The batch limit stays at 1,000. The overrun in the planned run is queueing behind
+other batches of the same payer.
+
+## Stand checks
+
+These checks were run on Podman 5.8.2 with Docker Compose v5.1.3. They were first done in
+Task 1 and repeated here.
+
+**S1.** Run after `make up`. `docker compose up -d --wait` exited 0, and every container was
+reported `Healthy`. `docker compose ps -a` showed:
+
+```
+NAME                                   IMAGE                                    COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+ta-firm-payments-challenge-app-1       docker.io/library/firm-payments:latest   "uvicorn app.main:ap…"   app       13 seconds ago   Up 11 seconds
+ta-firm-payments-challenge-app-2       docker.io/library/firm-payments:latest   "uvicorn app.main:ap…"   app       13 seconds ago   Up 10 seconds
+ta-firm-payments-challenge-app-3       docker.io/library/firm-payments:latest   "uvicorn app.main:ap…"   app       13 seconds ago   Up 11 seconds
+ta-firm-payments-challenge-db-1        docker.io/library/postgres:18            "postgres"               db        2 hours ago      Up 2 hours                127.0.0.1:5432->5432/tcp
+ta-firm-payments-challenge-lb-1        docker.io/library/nginx:stable           "nginx -g daemon off;"   lb        2 hours ago      Up 7 seconds              0.0.0.0:8000->80/tcp
+ta-firm-payments-challenge-migrate-1   docker.io/library/firm-payments:latest   "alembic upgrade head"   migrate   13 seconds ago   Exited (0) 1 second ago
+```
+
+Under Podman, `ps` does not print `(healthy)`. `docker inspect -f '{{.State.Health.Status}}'`
+gave `healthy` for all three app containers. `up -d --wait` starts the one-shot `migrate`
+service again each time; `alembic upgrade head` then has nothing to do.
+
+**S2.** 30 requests to `GET http://localhost:8000/healthz` gave these `X-Upstream` counts:
+
+| Replica | Requests |
+|---|---|
+| 10.89.2.87:8000 | 8 |
+| 10.89.2.88:8000 | 13 |
+| 10.89.2.89:8000 | 9 |
+
+That is three distinct values. The distribution right after a balancer restart is not strict
+round-robin.
+
+**S3.** The check started on a freshly seeded database (`make reset`).
+`docker stop $(docker compose ps -q app | head -1)` stopped `app-1` (10.89.2.88). Then
+`sample-request.json` was posted five times with `Idempotency-Key: s3`:
+
+| Request | Status | `Idempotent-Replayed` | `X-Upstream` | Time, s |
+|---|---|---|---|---|
+| 1 | 201 | absent | `10.89.2.88:8000, 10.89.2.89:8000` | 2.030 |
+| 2 | 201 | true | `10.89.2.87:8000` | 0.007 |
+| 3 | 201 | true | `10.89.2.89:8000` | 0.006 |
+| 4 | 201 | true | `10.89.2.87:8000` | 0.005 |
+| 5 | 201 | true | `10.89.2.89:8000` | 0.005 |
+
+Request 1 took 2 s because nginx first tried the stopped replica. Its address no longer
+answered, so the connect timed out after `proxy_connect_timeout` (2 s) instead of being refused.
+nginx then passed the request to the next replica. Nothing had been sent to the stopped replica,
+so passing the POST on was safe.
+
+Afterwards:
+
+- The five bodies were byte-identical.
+- The balances changed once: Pinecrest 3,674,875, Lopez 170,075 and Nair 1,405,050.
+- The database held 3 payment rows and 1 key row.
+
+**Restore.** `make up` started the replicas again and restarted `lb`. The image had been rebuilt
+by `make load --build`, so all three replicas were recreated with new addresses. S2 was then
+run again with 30 requests:
+
+| Replica | Requests |
+|---|---|
+| 10.89.2.103:8000 | 8 |
+| 10.89.2.104:8000 | 13 |
+| 10.89.2.105:8000 | 9 |
+
+Again three distinct values. `make reset` then returned the database to the three seeded firms.
+
+**Podman.** Nothing in the stand needed a Podman workaround:
+
+- three replicas started;
+- the service name resolved to every replica, since there were three `X-Upstream` values;
+- `--wait` waited for health.
+
+The only visible difference is the missing `(healthy)` in `ps`.

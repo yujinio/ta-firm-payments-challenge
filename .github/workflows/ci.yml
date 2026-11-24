@@ -11,3 +11,45 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker compose up -d --wait db
       - run: make check
+
+  # The run stand on Docker Engine (spec 13.8): three replicas behind the balancer.
+  stand:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      BASE_URL: http://localhost:8000
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose version
+      - run: make up
+      - name: Wait for the balancer
+        run: curl -fsS --retry 10 --retry-connrefused --retry-delay 1 "$BASE_URL/healthz"
+      - run: make seed
+      - name: The sample request returns 201
+        run: |
+          status=$(curl -sS -o response.json -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' --data-binary @sample-request.json \
+            "$BASE_URL/bulk-payments")
+          cat response.json
+          echo
+          test "$status" = 201
+      - name: 30 health checks reach three replicas (S2)
+        run: |
+          upstreams=$(for _ in $(seq 30); do
+            curl -sS -o /dev/null -D - "$BASE_URL/healthz" | tr -d '\r' | grep -i '^x-upstream:'
+          done | sort | uniq -c)
+          echo "$upstreams"
+          test "$(echo "$upstreams" | wc -l)" -eq 3
+      - name: Pinecrest balance is 3674875
+        run: |
+          balance=$(docker compose exec -T db psql -U postgres -d firm_payments -tAc \
+            "SELECT balance_cents FROM firms WHERE uuid = '3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41'")
+          echo "balance_cents=$balance"
+          test "$balance" = 3674875
+      - name: Stand state
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color

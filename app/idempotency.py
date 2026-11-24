@@ -1,7 +1,7 @@
 import hashlib
 import json
 from collections.abc import Sequence
-from typing import Any, cast
+from typing import cast
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.errors import IdempotencyKeyReuse
 from app.models import IdempotencyKey
+from app.schemas import BulkPaymentResponse
 
 
 def compute_request_hash(payer_uuid: str, items: Sequence[tuple[str, int, str]]) -> str:
@@ -27,7 +28,7 @@ def compute_request_hash(payer_uuid: str, items: Sequence[tuple[str, int, str]])
 
 def claim_key(
     session: Session, payer_uuid: str, key: str, request_hash: str
-) -> dict[str, Any] | None:
+) -> BulkPaymentResponse | None:
     """Claim the key for this transaction, or return the response stored under it.
 
     Returns None when the key is new. If another transaction holds an uncommitted
@@ -56,10 +57,11 @@ def claim_key(
         raise RuntimeError("a committed idempotency key has no stored response")
     if existing.request_hash != request_hash:
         raise IdempotencyKeyReuse("the Idempotency-Key was already used with a different request")
-    return cast(dict[str, Any], existing.response_body)
+    # Not checked at runtime: only store_response writes the column, with this shape.
+    return cast(BulkPaymentResponse, existing.response_body)
 
 
-def store_response(session: Session, payer_uuid: str, key: str, body: dict[str, Any]) -> None:
+def store_response(session: Session, payer_uuid: str, key: str, body: BulkPaymentResponse) -> None:
     """Store the 201 body under a key this transaction has claimed."""
     session.execute(
         update(IdempotencyKey)

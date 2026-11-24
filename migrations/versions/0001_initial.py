@@ -1,14 +1,17 @@
 """Initial schema: firms, payments, idempotency_keys."""
 
+from collections.abc import Sequence
+
 from alembic import op
 
-revision = "0001"
-down_revision = None
-branch_labels = None
-depends_on = None
+revision: str = "0001"
+down_revision: str | Sequence[str] | None = None
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    """Create firms and payments as given in spec section 7.1, and idempotency_keys (7.2)."""
     op.execute(
         """
         CREATE TABLE firms (
@@ -47,6 +50,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """Drop the three tables, payments before the firms it references; all data is lost."""
     op.execute("DROP TABLE idempotency_keys")
     op.execute("DROP TABLE payments")
     op.execute("DROP TABLE firms")

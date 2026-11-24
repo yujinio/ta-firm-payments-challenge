@@ -13,6 +13,7 @@ _engine_lock = threading.Lock()
 
 
 def _create_engine() -> Engine:
+    """Build the engine with a fixed-size pool; a checkout waits at most db_pool_timeout_s."""
     settings = get_settings()
     return create_engine(
         settings.database_url,
@@ -27,6 +28,7 @@ def _create_engine() -> Engine:
 
 
 def get_engine() -> Engine:
+    """Return the process's engine, creating it on the first call; safe across threads."""
     global _engine
     engine = _engine
     if engine is None:
@@ -38,6 +40,7 @@ def get_engine() -> Engine:
 
 
 def get_session() -> Iterator[Session]:
+    """Yield a session for one request and close it afterwards; it begins no transaction."""
     factory = sessionmaker(bind=get_engine(), expire_on_commit=False)
     with factory() as session:
         yield session

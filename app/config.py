@@ -4,6 +4,8 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    """Service configuration from environment variables (spec section 10)."""
+
     database_url: str
     max_payments_per_request: int = 1000
     max_description_length: int = 500
@@ -14,4 +16,5 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    """Return the process's settings, read from the environment on the first call."""
     return Settings()

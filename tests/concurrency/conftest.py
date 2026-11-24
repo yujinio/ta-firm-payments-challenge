@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.errors import DomainError
-from app.schemas import BulkPaymentRequest
+from app.schemas import BulkPaymentRequest, BulkPaymentResponse
 from app.service import BulkPaymentResult, build_command, execute_bulk_payment
 from tests.conftest import SEED_SQL
 
@@ -40,6 +40,7 @@ def run_concurrently[T](fn: Callable[[int], T], n: int) -> list[T]:
     barrier = threading.Barrier(n, timeout=THREAD_TIMEOUT_S)
 
     def start(index: int) -> T:
+        """Wait until all n threads are ready, then run fn(index)."""
         barrier.wait()
         return fn(index)
 
@@ -48,6 +49,7 @@ def run_concurrently[T](fn: Callable[[int], T], n: int) -> list[T]:
         return [future.result(timeout=THREAD_TIMEOUT_S) for future in futures]
 
 
+# Any: payload is a raw JSON request body; the service validates it.
 def run_service(
     payload: dict[str, Any], key: str | None = None, lock_timeout_ms: int = 5000
 ) -> BulkPaymentResult:
@@ -59,7 +61,7 @@ def run_service(
 
 def call_service(
     payload: dict[str, Any], key: str | None = None, lock_timeout_ms: int = 5000
-) -> tuple[str, dict[str, Any] | None]:
+) -> tuple[str, BulkPaymentResponse | None]:
     """Return ("created" | "replayed", body), or (error code, None) for a domain error."""
     try:
         result = run_service(payload, key, lock_timeout_ms)

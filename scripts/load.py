@@ -21,7 +21,6 @@ from collections import Counter
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
 
 import httpx2
 from sqlalchemy import Connection, create_engine, text
@@ -40,6 +39,8 @@ SCENARIOS = ("uniform", "hot-payer", "hot-payee", "max-batch")
 
 @dataclass(frozen=True)
 class Outcome:
+    """What one request got: status, error code, the replica that answered, duration."""
+
     status: int | None  # None: no response
     error: str | None  # the error code of a non-201 response, or the exception name
     upstream: str | None
@@ -104,6 +105,7 @@ def unexplained_balances(conn: Connection) -> int:
 
 
 def load_payment_rows(conn: Connection) -> int:
+    """Count the payment rows paid by load firms."""
     return int(
         conn.execute(
             text("SELECT count(*) FROM payments WHERE payer_firm_id >= :first"),
@@ -113,11 +115,13 @@ def load_payment_rows(conn: Connection) -> int:
 
 
 def random_amount(rng: random.Random) -> str:
+    """Return a random amount from 0.01 to 10.00 as the API's decimal string."""
     cents = rng.randint(1, 1000)  # 0.01 to 10.00
     return f"{cents // 100}.{cents % 100:02d}"
 
 
 def batch(payer: str, payees: Sequence[str], amounts: Sequence[str], label: str) -> bytes:
+    """Encode one request body; every payment carries label as its description."""
     payload = {
         "payer_firm_uuid": payer,
         "payments": [
@@ -160,6 +164,7 @@ def send_all(base_url: str, bodies: list[bytes], concurrency: int) -> tuple[list
     headers = {"Content-Type": "application/json"}
 
     def send(body: bytes) -> Outcome:
+        """Post one body with a free client; an httpx2 error becomes an Outcome without status."""
         client = clients.get()
         started = time.perf_counter()
         try:
@@ -195,11 +200,13 @@ def percentile(sorted_values: list[float], p: float) -> float:
     return sorted_values[rank - 1]
 
 
-def counts(counter: Counter[Any]) -> str:
+def counts(counter: Counter[str]) -> str:
+    """Render "key: n" pairs sorted by key, or "-" when there are none."""
     return "  ".join(f"{key}: {n}" for key, n in sorted(counter.items(), key=str)) or "-"
 
 
 def report(args: argparse.Namespace, outcomes: list[Outcome], wall_s: float) -> None:
+    """Print throughput, latency percentiles and the status, error and upstream counts."""
     durations = sorted(outcome.duration_ms for outcome in outcomes)
     print(f"scenario      {args.scenario}")
     print(f"requests      {len(outcomes)} (concurrency {args.concurrency})")
@@ -227,6 +234,7 @@ def report(args: argparse.Namespace, outcomes: list[Outcome], wall_s: float) -> 
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Prepare the load firms, run the scenario, check the database; return the exit code."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument(

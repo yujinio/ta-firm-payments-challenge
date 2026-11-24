@@ -41,7 +41,8 @@ def test_valid_amounts(text_, cents):
         "9" * 5000,
     ],
 )
-def test_invalid_amounts(text_):
+def test_invalid_amounts(text_: str) -> None:
+    """Only ASCII digits, an optional point and 1 or 2 decimals, in range and 11 long at most."""
     with pytest.raises(ValueError):
         parse_amount_cents(text_)
 

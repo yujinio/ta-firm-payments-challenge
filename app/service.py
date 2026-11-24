@@ -1,7 +1,6 @@
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any
 
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
@@ -11,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.config import Settings
 from app.errors import (
     BalanceOverflow,
+    ErrorDetail,
     FirmNotFound,
     InsufficientFunds,
     SelfPayment,
@@ -19,7 +19,13 @@ from app.errors import (
 )
 from app.idempotency import claim_key, compute_request_hash, store_response
 from app.models import Firm, Payment
-from app.schemas import INT32_MAX, BulkPaymentRequest, format_cents, parse_amount_cents
+from app.schemas import (
+    INT32_MAX,
+    BulkPaymentRequest,
+    BulkPaymentResponse,
+    format_cents,
+    parse_amount_cents,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +38,8 @@ _IDEMPOTENCY_KEY_PATTERN = re.compile(r"[\x21-\x7e]{1,255}")
 
 @dataclass(frozen=True)
 class PaymentItem:
+    """One parsed payment: payee as a canonical UUID string, amount in cents."""
+
     payee_uuid: str
     amount_cents: int
     description: str
@@ -39,6 +47,12 @@ class PaymentItem:
 
 @dataclass(frozen=True)
 class BulkPaymentCommand:
+    """A validated request with everything the transaction needs precomputed.
+
+    credits sums the amounts per payee; firm_uuids is the payer and every payee, the
+    set the transaction locks. idempotency_key and request_hash are both set or both None.
+    """
+
     payer_uuid: str
     items: tuple[PaymentItem, ...]
     total_cents: int
@@ -48,7 +62,8 @@ class BulkPaymentCommand:
     request_hash: str | None
 
 
-def _detail(loc: list[str | int], msg: str, type_: str) -> dict[str, Any]:
+def _detail(loc: list[str | int], msg: str, type_: str) -> ErrorDetail:
+    """Build one `details` entry in the shape Pydantic's errors are reported in."""
     return {"loc": loc, "msg": msg, "type": type_}
 
 
@@ -57,7 +72,7 @@ def build_command(
 ) -> BulkPaymentCommand:
     """Check the rules the schema cannot and derive what the transaction needs.
 
-    Pure: no database access.
+    Pure: no database access. Raises ValidationFailed or SelfPayment.
     """
     max_payments = settings.max_payments_per_request
     if len(request.payments) > max_payments:
@@ -123,7 +138,9 @@ def build_command(
 
 @dataclass(frozen=True)
 class BulkPaymentResult:
-    body: dict[str, Any]
+    """The 201 body and whether it was replayed from a stored Idempotency-Key response."""
+
+    body: BulkPaymentResponse
     replayed: bool
 
 
@@ -132,7 +149,10 @@ def execute_bulk_payment(
 ) -> BulkPaymentResult:
     """Apply the whole batch in one transaction, or reject it and change nothing.
 
-    The session must not be in a transaction yet; this function owns it.
+    The session must not be in a transaction yet; this function owns it. A rejection
+    raises a DomainError: FirmNotFound, InsufficientFunds, BalanceOverflow,
+    IdempotencyKeyReuse, or ServiceBusy on a lock timeout, a deadlock or a pool
+    timeout. Other database errors propagate.
     """
     try:
         with session.begin():
@@ -208,7 +228,7 @@ def _apply(
     for payee_uuid, credit in command.credits.items():
         firms[payee_uuid].balance_cents += credit
 
-    body: dict[str, Any] = {
+    body: BulkPaymentResponse = {
         "payer_firm_uuid": command.payer_uuid,
         "total_amount": format_cents(command.total_cents),
         "payments": [

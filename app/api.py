@@ -20,6 +20,7 @@ router = APIRouter()
 def healthz(
     response: Response, session: Annotated[Session, Depends(get_session)]
 ) -> dict[str, str]:
+    """Report whether the database answers; 503 when it does not."""
     try:
         session.execute(text("SELECT 1"))
     except SQLAlchemyError:
@@ -35,6 +36,11 @@ def create_bulk_payment(
     session: Annotated[Session, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> JSONResponse:
+    """Create every payment of the batch in one transaction, or none of them.
+
+    With an Idempotency-Key, a repeated request gets the stored 201 body again, with
+    the header Idempotent-Replayed: true.
+    """
     # Fields for the per-request log record written in app.main.
     request.state.payer = str(payload.payer_firm_uuid)
     request.state.payment_count = len(payload.payments)

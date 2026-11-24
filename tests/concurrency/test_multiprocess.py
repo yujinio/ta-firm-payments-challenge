@@ -42,6 +42,7 @@ CROSSING_ROUNDS = 10
 
 
 def _free_port() -> int:
+    """A loopback port that was free a moment ago; the server binds it right after."""
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])

@@ -156,7 +156,7 @@ def test_key_wait_then_rollback_executes(db):
     assert_ledger_consistent(db, start)
 
 
-def test_key_wait_then_commit_replays(db):
+def test_key_wait_then_commit_replays(db: Session) -> None:
     """Spec 8.3: if the transaction holding the key commits, the waiting request gets
     the stored response and changes nothing."""
     before = balances(db)
@@ -180,7 +180,7 @@ def test_key_wait_then_commit_replays(db):
     assert payment_rows(db) == []
 
 
-def test_pool_exhaustion_is_busy(db):
+def test_pool_exhaustion_is_busy(db: Session) -> None:
     """C9: no free connection within the pool timeout is busy, not an internal error."""
     before = balances(db)
     engine = create_engine(
@@ -268,7 +268,9 @@ def statements() -> Iterator[tuple[Session, list[str]]]:
     ],
     ids=["with_key", "without_key"],
 )
-def test_statement_order(statements, key, expected):
+def test_statement_order(
+    statements: tuple[Session, list[str]], key: str | None, expected: list[str]
+) -> None:
     """Pins spec 8.2: the key is claimed before any firm is read, firms are read once
     and locked in id order, and the response is stored after payments and balances."""
     session, seen = statements

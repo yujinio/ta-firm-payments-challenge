@@ -9,7 +9,9 @@ from app.service import BulkPaymentCommand, PaymentItem, execute_bulk_payment
 from tests.conftest import NAIR, PINECREST, balances, payment_rows
 
 
-def test_database_errors_do_not_carry_descriptions(db, caplog):
+def test_database_errors_do_not_carry_descriptions(
+    db: Session, caplog: pytest.LogCaptureFixture
+) -> None:
     """An unexpected DBAPIError is logged with its text by the server; spec 12 keeps
     descriptions out of logs, so the error text must not carry statement parameters."""
     caplog.set_level(logging.DEBUG)

@@ -1,5 +1,5 @@
 import re
-from typing import Annotated
+from typing import Annotated, TypedDict
 from uuid import UUID
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictStr
@@ -31,11 +31,13 @@ def format_cents(cents: int) -> str:
 
 
 def _check_amount(value: str) -> str:
+    """Reject an amount parse_amount_cents would reject; keep the string as sent."""
     parse_amount_cents(value)
     return value
 
 
 def _check_description(value: str) -> str:
+    """Reject descriptions that cannot be hashed or stored; the length limit is in build_command."""
     # PostgreSQL TEXT cannot store U+0000.
     if "\x00" in value:
         raise ValueError("description must not contain the character U+0000")
@@ -49,6 +51,8 @@ def _check_description(value: str) -> str:
 
 
 class PaymentIn(BaseModel):
+    """One payment of the request body."""
+
     model_config = ConfigDict(extra="forbid")
 
     amount: Annotated[StrictStr, AfterValidator(_check_amount)]
@@ -63,3 +67,20 @@ class BulkPaymentRequest(BaseModel):
 
     payer_firm_uuid: UUID
     payments: Annotated[list[PaymentIn], Field(min_length=1)]
+
+
+class PaymentOut(TypedDict):
+    """One payment of the 201 body, in request order."""
+
+    id: int
+    payee_firm_uuid: str
+    amount: str
+    description: str
+
+
+class BulkPaymentResponse(TypedDict):
+    """The 201 body; it is also what an Idempotency-Key stores and replays."""
+
+    payer_firm_uuid: str
+    total_amount: str
+    payments: list[PaymentOut]

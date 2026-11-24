@@ -29,7 +29,7 @@ test:
 lint:
 	uv run --locked ruff check .
 	uv run --locked ruff format --check .
-	uv run --locked mypy app
+	uv run --locked mypy app scripts migrations
 
 check: test lint
 

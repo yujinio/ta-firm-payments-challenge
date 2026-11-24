@@ -20,7 +20,15 @@ line-length = 100
 extend-exclude = ["docs", "*.md"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "D"]
+# Docstrings are required on classes, functions and methods, not on modules or packages.
+ignore = ["D100", "D104"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
 
 [tool.mypy]
 strict = true

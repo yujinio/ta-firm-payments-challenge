@@ -14,10 +14,11 @@ The allocation below is my judgment on that basis. If limits allow, steps 2 and 
 
 ## General rules for all steps
 
-1. Each step is a separate session. The session log is exported to `ai-logs/` without edits: the task requires this.
-2. The agent does not deviate from the specification. If it finds a contradiction or gap, it stops and asks.
-3. You read each step's output before moving to the next and record your own edits as separate commits. Reviewers evaluate exactly this involvement.
-4. Code, comments, commit messages and the README are in English.
+1. Steps 0–1 and step 5 are separate sessions. Steps 1a–4 run in one controller session under superpowers:subagent-driven-development: the controller dispatches a fresh implementer subagent per plan task with the model named in the table below, a task reviewer after each task, and a whole-branch review at the end. This replaced one session per step (decided 2026-11-24) because it is faster and keeps a review after every task.
+2. Logs. Every working session goes to `ai-logs/`: the design sessions, the controller session together with each subagent's transcript, and the review session. The only change is masking the account email and the home directory path. Aborted early attempts are left out. The README says both things plainly, because the task asks for unedited logs.
+3. The agent does not deviate from the specification. If it finds a contradiction or gap, it stops and asks. Under subagent-driven execution the controller rules on it, records the ruling in its ledger, and reports it.
+4. You read each step's output before moving to the next and record your own edits as separate commits. Reviewers evaluate exactly this involvement.
+5. Code, comments, commit messages and the README are in English.
 
 ## Steps
 
@@ -25,15 +26,17 @@ The allocation below is my judgment on that basis. If limits allow, steps 2 and 
 |---|---|---|---|
 | 0 | Design and specification | Fable 5.2 | Decisions with non-obvious consequences; done in this session |
 | 1 | Implementation plan | Fable 5.2, this same session | The context of the decisions is already here; a new session would have to rebuild it |
-| 2 | Scaffold: project, Docker, migrations, models, configuration | Sonnet 5.5 | The task is clearly described by sections 6, 7, 10, 11 |
-| 3 | Core: validation, transaction, idempotency, errors | Opus 5.5 | The cost of error is highest here: the order of transaction steps and locks |
-| 4 | Concurrency tests and load script | Opus 5.5 | Race tests are easy to write so that they pass by accident |
+| 1a | Validation of the documents against the task statement; then control of steps 2–4 | Opus 5.5, controller session | A fresh read of the task found gaps the design sessions missed (spec revision 4) |
+| 2 | Scaffold: project, Docker, migrations, models, configuration | Sonnet 5.5, implementer subagents | The task is clearly described by sections 6, 7, 10, 11 |
+| 3 | Core: validation, transaction, idempotency, errors | Opus 5.5, implementer subagents | The cost of error is highest here: the order of transaction steps and locks |
+| 4 | Concurrency tests and load script | Opus 5.5, implementer subagents | Race tests are easy to write so that they pass by accident |
+| 4a | Whole-branch review of steps 2–4 | Fable 5.2, subagent | The final review needs the most capable model |
 | 5 | Independent review | Fable 5.2, new session | The reviewer must not see how the code was written |
 | 6 | README | You; Sonnet 5.5 for language editing | The README is read as your text; the substantive sections must be yours |
 
 ## Mapping to the implementation plan
 
-The plan is `docs/plan.md`. Start every prompt for steps 2–4 with the line "Follow docs/plan.md, Tasks N–M, step by step", using this mapping:
+The plan is `docs/plan.md`. Under subagent-driven execution each implementer receives the full text of its one plan task, not the prompts below; the prompts remain the checklist the controller holds each step to. Mapping:
 
 | Workflow step | Plan tasks |
 |---|---|
@@ -99,7 +102,7 @@ At the end, show the full output of the tests and static checks.
 
 ```
 Read docs/spec.md, sections 9 and 13. The endpoint is implemented and the contract tests pass.
-Write tests C1–C7 and I5, and the script scripts/load.py (scenario L1).
+Write tests C1–C9 and I5, and the script scripts/load.py (scenario L1).
 
 Requirements for the tests:
 - Real PostgreSQL only.

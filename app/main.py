@@ -25,6 +25,7 @@ from app.errors import (
     ServiceBusy,
     ValidationFailed,
 )
+from app.schema_revision import check_engine_schema
 from app.schemas import format_cents
 
 INSTANCE = socket.gethostname()
@@ -67,13 +68,18 @@ def _configure_logging() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Configure logging, cap the thread pool at the connection pool size, build the engine."""
+    """Configure logging, cap the thread pool at the pool size, build the engine, check the schema.
+
+    A database that is not at the migrations' head fails startup, so the replica never serves.
+    """
     _configure_logging()
     # Synchronous endpoints wait for a thread instead of failing on pool checkout.
     # The limiter can be changed only from the event loop.
     anyio.to_thread.current_default_thread_limiter().total_tokens = get_settings().db_pool_size
     # Built before the first request, so requests never race to create it.
-    get_engine()
+    engine = get_engine()
+    # A replica never serves against a schema it was not built for (spec section 5.6).
+    check_engine_schema(engine)
     yield
 
 

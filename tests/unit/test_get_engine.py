@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 
 import app.db
+import app.main
 from app.db import get_engine
 from app.main import app as application
 
@@ -42,7 +43,9 @@ def test_concurrent_first_calls_share_one_engine(no_engine_yet):
     assert len(no_engine_yet) == 1, f"{len(no_engine_yet)} engines from {THREADS} first calls"
 
 
-def test_startup_builds_the_engine(no_engine_yet):
+def test_startup_builds_the_engine(no_engine_yet, monkeypatch):
+    # The schema check opens a connection; tests/db/test_schema_revision.py covers it.
+    monkeypatch.setattr(app.main, "check_engine_schema", lambda engine: None)
     with TestClient(application):
         engine = app.db._engine
     assert engine is not None

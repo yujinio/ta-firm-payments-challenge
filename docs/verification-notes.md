@@ -360,6 +360,8 @@ ta-firm-payments-challenge-lb-1        docker.io/library/nginx:stable           
 ta-firm-payments-challenge-migrate-1   docker.io/library/firm-payments:latest   "alembic upgrade head"   migrate   13 seconds ago   Exited (0) 1 second ago
 ```
 
+This output predates commit ca03d4a. Since then `lb` publishes `127.0.0.1:${LB_PORT:-8000}` instead of `0.0.0.0:8000`, and `db` publishes `127.0.0.1:${DB_PORT:-5432}`.
+
 Under Podman, `ps` does not print `(healthy)`. `docker inspect -f '{{.State.Health.Status}}'`
 gave `healthy` for all three app containers. `up -d --wait` starts the one-shot `migrate`
 service again each time; `alembic upgrade head` then has nothing to do.
@@ -417,3 +419,25 @@ Again three distinct values. `make reset` then returned the database to the thre
 - `--wait` waited for health.
 
 The only visible difference is the missing `(healthy)` in `ps`.
+
+## CI on Docker Engine
+
+The workflow `.github/workflows/ci.yml` has two jobs, both on GitHub-hosted `ubuntu-latest` runners.
+
+- `check` installs uv 0.13.9 and runs `make check`.
+- `stand` runs `make up` and `make seed`, then:
+  - posts `sample-request.json` through `localhost:8000` and expects 201;
+  - counts `X-Upstream` over 30 `GET /healthz` and expects three distinct values;
+  - reads Pinecrest's balance with `psql` and expects 3674875.
+
+  On failure it prints `docker compose ps -a` and the logs.
+
+First run on the public repository: run 45408968632 on 2026-11-24, commit 6abb684.
+
+- `check` passed: 151 tests in 11.94 s, then ruff and mypy were clean.
+- `stand` passed on Docker Compose v5.1.3.
+  - The sample request returned 201 with `total_amount` `"13251.25"`.
+  - The health checks reached three replicas.
+  - Pinecrest's balance was 3674875.
+
+This is the first run of the stand on Docker Engine; everything before it ran on Podman.

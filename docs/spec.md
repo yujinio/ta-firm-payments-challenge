@@ -1,7 +1,7 @@
 # Firm Payments: Bulk Payment Service Specification
 
 - Date: 2026-11-21
-- Status: approved; revision 4 (2026-11-24). Revision 2 folded in the rules found while planning and the probe results of section 17. Revision 3 adds the run stand (section 5.6) and the justified batch limit (section 5.7). Revision 4 follows a validation against the task statement: the second request from the task (page 3) becomes a sample, the rationale for the service table is restated, the Python version is pinned, and the local container runtime is recorded
+- Status: approved; revision 5 (2026-11-24). Revision 2 folded in the rules found while planning and the probe results of section 17. Revision 3 adds the run stand (section 5.6) and the justified batch limit (section 5.7). Revision 4 follows a validation against the task statement: the second request from the task (page 3) becomes a sample, the rationale for the service table is restated, the Python version is pinned, and the local container runtime is recorded. Revision 5 records what the implementation and its checks found: the observed mutation results (sections 5.4, 8.3, 13.7), the measured batch limit (5.7), the stand checks on Podman and Docker Engine (13.8, 17), configurable host ports and the balancer's body limit (5.6), the routing error codes (8.1) and the per-wait meaning of `lock_timeout` (9.3, 15). Measured results are in `docs/verification-notes.md`
 - Location in repository: `docs/spec.md`
 - Basis: TaxDome technical challenge "Firm Payments: Build a bulk payment service" (PDF, 5 pages)
 
@@ -116,7 +116,7 @@ Guarantee: each key corresponds to at most one execution.
 | In-memory process locks | Rejected: they do not work across instances |
 | Balance as a sum over a journal | Rejected: contradicts the `balance_cents` column |
 
-Rationale [R]: default isolation level, no retries, the check is readable in code and deterministically testable. A single acquisition order is the protection against deadlocks recommended by PostgreSQL documentation. A probe confirmed the choice (section 17): 2,400 crossing transactions with the ordered query produced no deadlocks, and the same run without `ORDER BY` produced 80. Cost: payee rows are locked for the whole transaction; the transaction is short, and this is accepted (section 9.3).
+Rationale [R]: default isolation level, no retries, the check is readable in code and deterministically testable. A single acquisition order is the protection against deadlocks recommended by PostgreSQL documentation. A probe confirmed the choice (section 17): 2,400 crossing transactions with the ordered query produced no deadlocks, and the same run without `ORDER BY` produced 80. In the project (PostgreSQL 18.6) the two-firm crossing test C2 did not deadlock without `ORDER BY`; the three-firm cycle test C3 did, in every run (section 13.7). Cost: payee rows are locked for the whole transaction; the transaction is short, and this is accepted (section 9.3).
 
 ### 5.5. Synchronous or asynchronous database access
 
@@ -146,7 +146,8 @@ The number is a property of the stand, not a capacity recommendation.
 **Consequences of the stand:**
 
 - Migrations run once, in a separate `migrate` service that the replicas wait for. Three replicas each running `alembic upgrade head` at start would race.
-- Each replica is a single Uvicorn process. Replicas publish no host port. The balancer publishes port 8000; `db` publishes `127.0.0.1:5432` so that tests and the multi-process test server can run on the host.
+- Each replica is a single Uvicorn process. Replicas publish no host port. The balancer publishes `127.0.0.1:${LB_PORT:-8000}`; `db` publishes `127.0.0.1:${DB_PORT:-5432}` so that tests and the multi-process test server can run on the host. Both bind to the loopback interface: the API has no authentication. The variables let a machine that already runs PostgreSQL or uses port 8000 choose other ports.
+- The balancer accepts bodies up to 8 MB (`client_max_body_size`); nginx's 1 MB default is below the largest valid request (1,000 payments with 500-character non-ASCII descriptions, about 1.1 MB). It forwards the client's `Host` header, so redirects keep the published port.
 - nginx does not pass a `POST` to another replica once it has been sent to one, so the balancer never duplicates a payment by itself. A request that could not be delivered at all is passed to the next replica. Retrying after a lost response stays the client's job, with an idempotency key.
 - nginx resolves the replica addresses when it starts. After replicas are recreated or rescaled, the balancer must be restarted.
 - The balancer adds the response header `X-Upstream` with the address of the replica that served the request, so the distribution can be observed (check S2).
@@ -176,6 +177,8 @@ Growth is linear, about 0.11 ms per payment. At 1,000 payments the hold is 109 m
 
 These figures come from one machine and are not a guarantee. Load scenario L1 repeats the measurement in the project, through the balancer, and records the result.
 
+Measured in the project (`docs/verification-notes.md`, through nginx, one Podman VM with 6 CPUs): without contention a 1,000-payment request took 50.3 ms median and 69.9 ms at most end to end, so the locks are held for at most that long, about a quarter of the budget. With four such requests from one payer in parallel, the median was 196.0 ms and the maximum 257.6 ms: each request also waits behind the others on the payer's row. The limit stays at 1,000.
+
 A consequence to state in the README: a client with more than 1,000 payments splits them into several requests, and each request is atomic on its own, not all of them together.
 
 ## 6. Stack
@@ -189,7 +192,7 @@ A consequence to state in the README: a client with more than 1,000 payments spl
 | Driver | psycopg 3 | [P] |
 | Migrations | Alembic | [P] |
 | Database | PostgreSQL 18. Version 19.0 was released on 2026-11-19; a major release a few days old is not where a payment service should start, and nothing here needs its features | [P] |
-| Tests | pytest, httpx | [P] |
+| Tests | pytest, httpx2 (the HTTP client Starlette's test client requires) | [P] |
 | Quality | ruff, mypy | [P] |
 | Run | Docker Compose: PostgreSQL, a one-shot migration service, three application replicas, an nginx balancer (section 5.6) | [R] |
 | Dependencies | uv with a lock file; the implementer may replace it with pip | [P] |
@@ -326,6 +329,11 @@ A single format:
 | 422 | `idempotency_key_reuse` | Same key with different request content |
 | 503 | `busy` | Lock wait or pool connection wait timed out; header `Retry-After: 1` |
 | 500 | `internal_error` | Unexpected error; details only in logs |
+| 404 | `not_found` | Unknown path |
+| 405 | `method_not_allowed` | Known path, wrong method |
+| other 4xx | `http_error` | Any other HTTP-level error raised by the framework |
+
+A body that is not valid UTF-8 is a `validation_error` too, not a 400. When the body is rejected and the request's `Content-Type` is not JSON (curl's `-d` sends `application/x-www-form-urlencoded`), the message says to send `Content-Type: application/json`. `details` carry only `loc`, `msg` and `type`, never the rejected input. A body over the balancer's 8 MB limit is refused by nginx with its own 413 page before it reaches the service.
 
 Rationale [P]: the task requires 422 for a rejected request and does not distinguish reasons, so all rejections caused by the request return 422, and the reason is carried in `code`. FastAPI's default validation error handler is overridden so that the format is uniform. For a key reused with different content, 422 matches the recommendation of the IETF draft.
 
@@ -382,7 +390,7 @@ Any rejection in steps 2–6 rolls back the whole transaction, including the key
 
 **Why the balance check is in code rather than in `WHERE`.** The row is locked, the value is current, the condition is in one place, and it distinguishes the reasons for rejection.
 
-**Why the lock order is specifically by `id`.** `id` is immutable, so the order is the same for all transactions at any time. The documentation does not state outright that `ORDER BY ... FOR NO KEY UPDATE` acquires locks in sorted order. A probe supports it (section 17): the query plan puts the `LockRows` node above `Sort`, so rows are locked as they leave the sort, and the same workload without `ORDER BY` deadlocks. Tests C2 and C3 and the mutation check (section 13.7) re-confirm this in the project.
+**Why the lock order is specifically by `id`.** `id` is immutable, so the order is the same for all transactions at any time. The documentation does not state outright that `ORDER BY ... FOR NO KEY UPDATE` acquires locks in sorted order. A probe supports it (section 17): the query plan puts the `LockRows` node above `Sort`, so rows are locked as they leave the sort, and the same workload without `ORDER BY` deadlocks. In the project the plan has the same shape on PostgreSQL 18.6, and without `ORDER BY` the cycle test C3 deadlocks while the two-firm crossing test C2 does not (section 13.7); why C2 stays clean is not established.
 
 ## 9. Concurrency and invariants
 
@@ -413,7 +421,7 @@ Any rejection in steps 2–6 rolls back the whole transaction, including the key
 - A "hot" payee is a consequence of the schema, where the balance is stored in the row; the chosen approach holds the row slightly longer than a conditional `UPDATE`.
 - Hold time equals the transaction duration, so the transaction contains nothing except four to five database queries: parsing and checks are moved outside, and payments are inserted in one operation.
 - Batch size is bounded so that one request does not hold locks on thousands of firms for long. The bound and its measurement are in section 5.7.
-- Waiting is bounded by `lock_timeout`: when it is exhausted, the client receives 503, not an indefinite wait.
+- Each lock wait is bounded by `lock_timeout`: when it is exhausted, the client receives 503, not an indefinite wait. The bound applies to each wait, not to the request: a request that waits on several rows in turn can wait up to `lock_timeout` for each of them. nginx gives up on a response after 60 s (`proxy_read_timeout`) and returns its own 504 page, while the transaction may still commit.
 - The real limit is connections: a waiting transaction occupies a connection. Pool size multiplied by the number of instances must not exceed the database's connection limit. On the stand this is 3 × 10 = 30 of PostgreSQL's default 100.
 
 ## 10. Configuration
@@ -428,6 +436,8 @@ Via environment variables (pydantic-settings).
 | `LOCK_TIMEOUT_MS` | 5000 | Lock wait limit |
 | `DB_POOL_SIZE` | 10 | Connection pool size |
 | `DB_POOL_TIMEOUT_S` | 5 | Wait limit for a connection from the pool |
+
+The Compose file also reads `DB_PORT` (default 5432) and `LB_PORT` (default 8000), the host ports of the database and the balancer; host-side tests follow `DB_PORT`.
 
 All default values are **[P]**, except `MAX_PAYMENTS_PER_REQUEST`, which is **[R]** (section 5.7). The pool is created without overflow (`max_overflow=0`) and with a connection health check before handing out a connection. Synchronous endpoints run in AnyIO's thread pool, which allows 40 threads by default (probe, section 17). At startup the application sets that limit to `DB_POOL_SIZE`, so a request waits for a thread instead of failing on pool checkout. The limit can be changed only from the event loop (the lifespan handler), not from a worker thread.
 
@@ -452,14 +462,20 @@ tests/
   concurrency/     races, locks, idempotency under parallel load
 scripts/
   seed.sql         the three firms from the task
+  init-test-db.sql creates the test database in the db container
   load.py          load scenarios
 docs/
   spec.md          this document
+  plan.md          implementation plan
+  agent-workflow.md         how the AI agents were used
+  verification-notes.md     measured and observed results
 ai-logs/           logs of AI work (section 14.3)
 deploy/
   nginx.conf       balancer configuration
+.github/workflows/ci.yml    make check; the stand on Docker Engine
+Dockerfile         image for migrate and app
 docker-compose.yml db, migrate, app (three replicas), lb
-Makefile           up, seed, reset, test, lint, check, load
+Makefile           up, seed, reset (Compose); test, lint, check, load (uv on the host)
 .python-version    3.14
 sample-request.json          the request from page 4 of the task
 format-example-request.json  the request from page 3 of the task
@@ -565,7 +581,7 @@ Each mutation is applied to the service code alone, the concurrency tests are ru
 | M2 | Remove `ORDER BY` from the lock query | C2 or C3 fails with deadlocks |
 | M3 | Lock the payer in one query and the payees in a second | C2 fails with deadlocks |
 
-A mutation that leaves every test green means the tests are too weak and must be strengthened. The observed results are recorded in `docs/verification-notes.md`.
+A mutation that leaves every test green means the tests are too weak and must be strengthened. The observed results are recorded in `docs/verification-notes.md`: M1 failed C1, C2, C3, C4 and C6; M2 failed C3 in 3 of 3 runs while C2 stayed green; M3 failed C2 and C3. No test needed strengthening.
 
 ### 13.8. Checks of the run stand
 
@@ -575,9 +591,11 @@ A mutation that leaves every test green means the tests are too weak and must be
 | S2 | 30 requests to `GET /healthz` through the balancer | The `X-Upstream` header takes exactly three distinct values |
 | S3 | Stop one `app` container; send the sample request five times with one idempotency key; start the container again | Five responses 201, four of them replays; balances changed once |
 
-Docker was not available where the design probes ran, so S1–S3 are the first real verification of the stand. Until then it rests on the nginx and Compose documentation (section 17).
+Docker was not available where the design probes ran, so S1–S3 were the first real verification of the stand.
 
 The development machine runs Podman 5.8 (rootful, netavark) behind the `docker` command, with Docker Compose v5.1 as the compose provider. Reviewers will most likely run Docker Engine or Docker Desktop. S1–S3 are therefore run locally on Podman, and CI on GitHub-hosted runners exercises the same `docker compose` commands on Docker Engine. The README states where each was verified. If the stand behaves differently under Podman (replica count, service-name DNS returning every replica, `--wait`), the difference is reported with evidence, not worked around in the Compose file.
+
+Outcome: S1–S3 passed on Podman 5.8.2 with no workaround; the only visible difference is that Podman's `ps` does not print `(healthy)`. Under Podman a stopped replica's address times out instead of refusing the connection, so the first request after S3's stop took 2 s (`proxy_connect_timeout`) before nginx passed it on. The CI job `stand` brings the stand up on Docker Engine with `make up`, posts the sample request (201, Pinecrest 3674875) and checks three distinct `X-Upstream` values over 30 health checks; it passes.
 
 ## 14. Validation
 
@@ -644,6 +662,8 @@ Step 6 checks understanding of the task on the task's own data: the balance afte
 10. If `Idempotency-Key` is sent more than once, the first value is used. Improvement: reject such a request.
 11. The stand is not highly available: one balancer, one database. nginx resolves replica addresses only at start, so the balancer is restarted after replicas are recreated.
 12. A client with more than 1,000 payments must split them into several requests; atomicity then holds per request, not across them.
+13. `lock_timeout` bounds each lock wait, not the whole request (section 9.3). Improvement: a transaction-scoped `statement_timeout` or a request deadline below the balancer's read timeout.
+14. A body over 8 MB gets nginx's own 413 page instead of the single error format. Improvement: an nginx `error_page` that returns the JSON format.
 
 ## 16. Left to the implementer
 
@@ -676,7 +696,7 @@ Confirmed by throwaway probes on 2026-11-21 and 2026-11-24 (PostgreSQL 16.15, ps
 - `SET LOCAL lock_timeout` with a bound parameter fails with a syntax error. `set_config('lock_timeout', ..., true)` works and resets at commit.
 - `INSERT ... ON CONFLICT DO NOTHING` waits for an uncommitted conflicting row. If that transaction commits, the insert returns no row and the next statement sees the committed row. If it rolls back, the insert succeeds.
 - `lock_timeout` bounds both that wait and a row-lock wait. The error is SQLSTATE 55P03; SQLAlchemy raises it as `OperationalError` with `orig.sqlstate` set.
-- The plan of the lock query is `LockRows` above `Sort`. 2,400 crossing transactions with `ORDER BY id` gave 0 deadlocks; the same run without `ORDER BY` gave 80.
+- The plan of the lock query is `LockRows` above `Sort`. 2,400 crossing transactions with `ORDER BY id` gave 0 deadlocks; the same run without `ORDER BY` gave 80. The project did not reproduce the 80 with two firms on PostgreSQL 18.6; it reproduced deadlocks without `ORDER BY` with three firms (section 13.7).
 - Locking the payer and the payee in separate queries deadlocks under a forced interleaving (SQLSTATE 40P01).
 - After waiting for a row lock, the lock query returns the value committed by the other transaction.
 - A firm row held `FOR NO KEY UPDATE` does not block an insert into `payments` that references it. Held `FOR UPDATE`, it does.
@@ -688,7 +708,7 @@ Confirmed by throwaway probes on 2026-11-21 and 2026-11-24 (PostgreSQL 16.15, ps
 - AnyIO's default thread limit is 40. It can be changed in the lifespan handler but not from a worker thread.
 - One transaction of 1,000 payments to 1,000 distinct payees held its locks for 109 ms (median of 7 runs; table in section 5.7).
 
-Docker was not available where the probes ran. The run stand (section 5.6) therefore rests on the nginx and Compose documentation listed above until checks S1–S3 run in the project.
+Docker was not available where the probes ran, so the design of the run stand (section 5.6) rested on the nginx and Compose documentation listed above. Checks S1–S3 have since run on Podman and the CI job on Docker Engine (section 13.8).
 
 Claims the project's own tests must re-confirm on the pinned versions:
 

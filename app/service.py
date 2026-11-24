@@ -1,11 +1,30 @@
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+from sqlalchemy.orm import Session
+
 from app.config import Settings
-from app.errors import SelfPayment, ValidationFailed
+from app.errors import (
+    BalanceOverflow,
+    FirmNotFound,
+    InsufficientFunds,
+    SelfPayment,
+    ServiceBusy,
+    ValidationFailed,
+)
 from app.idempotency import compute_request_hash
+from app.models import Firm, Payment
 from app.schemas import INT32_MAX, BulkPaymentRequest, format_cents, parse_amount_cents
+
+logger = logging.getLogger(__name__)
+
+_LOCK_NOT_AVAILABLE = "55P03"
+_DEADLOCK_DETECTED = "40P01"
 
 # Visible ASCII, no spaces.
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"[\x21-\x7e]{1,255}")
@@ -100,3 +119,94 @@ def build_command(
         idempotency_key=idempotency_key,
         request_hash=request_hash,
     )
+
+
+@dataclass(frozen=True)
+class BulkPaymentResult:
+    body: dict[str, Any]
+    replayed: bool
+
+
+def execute_bulk_payment(
+    session: Session, command: BulkPaymentCommand, lock_timeout_ms: int
+) -> BulkPaymentResult:
+    """Apply the whole batch in one transaction, or reject it and change nothing.
+
+    The session must not be in a transaction yet; this function owns it.
+    """
+    try:
+        with session.begin():
+            body = _apply(session, command, lock_timeout_ms)
+    except DBAPIError as exc:
+        sqlstate = getattr(exc.orig, "sqlstate", None)
+        if sqlstate == _DEADLOCK_DETECTED:
+            # Locks are taken in one query ordered by id, so this should not happen.
+            # exc.orig, not exc: the SQLAlchemy message carries the statement
+            # parameters, and those include payment descriptions.
+            logger.error("deadlock detected in a bulk payment transaction: %s", exc.orig)
+        if sqlstate in (_LOCK_NOT_AVAILABLE, _DEADLOCK_DETECTED):
+            raise ServiceBusy("the payment could not be processed in time; retry") from exc
+        raise
+    except PoolTimeoutError as exc:
+        raise ServiceBusy("no database connection is available; retry") from exc
+    return BulkPaymentResult(body=body, replayed=False)
+
+
+def _apply(session: Session, command: BulkPaymentCommand, lock_timeout_ms: int) -> dict[str, Any]:
+    """Transaction steps of spec section 8.2; only database work happens here."""
+    session.execute(
+        text("SELECT set_config('lock_timeout', :value, true)"),
+        {"value": f"{lock_timeout_ms}ms"},
+    )
+
+    # The only read of firms: it finds, checks and locks them in one consistent order.
+    locked = session.scalars(
+        select(Firm)
+        .where(Firm.uuid.in_(command.firm_uuids))
+        .order_by(Firm.id)
+        .with_for_update(key_share=True)
+        .execution_options(populate_existing=True)
+    ).all()
+    firms = {firm.uuid: firm for firm in locked}
+
+    missing = command.firm_uuids - firms.keys()
+    if missing:
+        raise FirmNotFound(f"firms not found: {', '.join(sorted(missing))}")
+
+    payer = firms[command.payer_uuid]
+    if payer.balance_cents < command.total_cents:
+        raise InsufficientFunds("the payer's balance does not cover the batch total")
+
+    for payee_uuid, credit in command.credits.items():
+        if firms[payee_uuid].balance_cents + credit > INT32_MAX:
+            raise BalanceOverflow(f"the balance of payee {payee_uuid} would exceed the maximum")
+
+    rows = [
+        Payment(
+            payer_firm_id=payer.id,
+            payee_firm_id=firms[item.payee_uuid].id,
+            amount_cents=item.amount_cents,
+            description=item.description,
+        )
+        for item in command.items
+    ]
+    session.add_all(rows)
+    session.flush()
+
+    payer.balance_cents -= command.total_cents
+    for payee_uuid, credit in command.credits.items():
+        firms[payee_uuid].balance_cents += credit
+
+    return {
+        "payer_firm_uuid": command.payer_uuid,
+        "total_amount": format_cents(command.total_cents),
+        "payments": [
+            {
+                "id": row.id,
+                "payee_firm_uuid": item.payee_uuid,
+                "amount": format_cents(item.amount_cents),
+                "description": item.description,
+            }
+            for row, item in zip(rows, command.items, strict=True)
+        ],
+    }

@@ -16,6 +16,9 @@ def get_engine() -> Engine:
         max_overflow=0,
         pool_timeout=settings.db_pool_timeout_s,
         pool_pre_ping=True,
+        # Error text must not carry bound parameters: they include payment
+        # descriptions, which never go to logs (spec section 12).
+        hide_parameters=True,
     )
 
 

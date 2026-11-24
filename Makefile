@@ -2,8 +2,11 @@ TEST_DB_URL = postgresql+psycopg://postgres:postgres@db:5432/firm_payments_test
 
 .PHONY: up seed reset test lint check load
 
+# nginx resolves the replicas only at start, and recreated replicas get new
+# addresses, so the balancer is restarted after every up.
 up:
 	docker compose up --build -d --wait
+	docker compose restart lb
 
 seed:
 	docker compose exec -T db psql -U postgres -d firm_payments < scripts/seed.sql

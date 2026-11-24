@@ -24,6 +24,9 @@ request_logger = logging.getLogger("app.requests")
 
 _HTTP_ERROR_CODES = {404: "not_found", 405: "method_not_allowed"}
 
+# Pydantic messages that quote part of the input ("found `z` at 0"), by error type.
+_FIXED_MESSAGES = {"uuid_parsing": "Input should be a valid UUID"}
+
 
 def _configure_logging() -> None:
     # Uvicorn configures only its own loggers; without a handler INFO records are dropped.
@@ -104,7 +107,11 @@ async def handle_request_validation_error(
     # Only loc, msg and type: input and ctx carry the rejected value, which may be
     # sensitive or impossible to encode (a lone surrogate from a \ud800 escape).
     details = [
-        {"loc": list(error["loc"]), "msg": error["msg"], "type": error["type"]}
+        {
+            "loc": list(error["loc"]),
+            "msg": _FIXED_MESSAGES.get(error["type"], error["msg"]),
+            "type": error["type"],
+        }
         for error in exc.errors()
     ]
     return _error_response(

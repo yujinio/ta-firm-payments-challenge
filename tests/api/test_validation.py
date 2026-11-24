@@ -88,10 +88,29 @@ def test_lone_surrogate_in_description(client, db):
     assert payment_rows(db) == []
 
 
-def test_details_do_not_echo_input(client):
-    r = client.post("/bulk-payments", json=_with_amount("1x-secret-amount"))
+ECHO_PROBES = {
+    "amount": (_with_amount("1x-secret-amount"), "1x-secret-amount"),
+    # Pydantic's uuid_parsing message would say "found `z` at 0".
+    "payee_uuid": (bulk(PINECREST, ("z", "1")), "`z`"),
+    "payer_uuid": (bulk("zq-secret-payer", (NAIR, "1")), "`z`"),
+}
+
+
+@pytest.mark.parametrize(("payload", "echo"), ECHO_PROBES.values(), ids=ECHO_PROBES.keys())
+def test_details_do_not_echo_input(client, payload, echo):
+    r = client.post("/bulk-payments", json=payload)
     assert_validation_error(r)
-    assert "1x-secret-amount" not in r.text
+    assert echo not in r.text
+
+
+def test_uuid_errors_have_fixed_message(client):
+    r = client.post("/bulk-payments", json=bulk(PINECREST, ("z", "1")))
+    [detail] = assert_validation_error(r)["details"]
+    assert detail == {
+        "loc": ["body", "payments", 0, "payee_firm_uuid"],
+        "msg": "Input should be a valid UUID",
+        "type": "uuid_parsing",
+    }
 
 
 def test_a12_error_format(client, db):

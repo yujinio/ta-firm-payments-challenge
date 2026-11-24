@@ -150,7 +150,7 @@ This continues from [Run it](#run-it).
 
    On Podman one of the five requests can take about 2 s while nginx gives up on the stopped replica and passes the request on.
 
-6. Run `make check`. Expected: exit code 0, with 156 tests passing and ruff and mypy clean.
+6. Run `make check`. Expected: exit code 0, with 159 tests passing and ruff and mypy clean.
 
 ### Tests
 
@@ -159,7 +159,7 @@ The tests run against a real PostgreSQL in the stand's `db` container, in a sepa
 | Group | Tests | What they show |
 |---|---|---|
 | `tests/unit` | 64 | Amount parsing (U1–U3): no float, full match of `[0-9]+(\.[0-9]{1,2})?`, the 32-bit bound. Also the request hash, the request schema, the command builder, and engine construction. |
-| `tests/db` | 11 | Migrations apply to an empty database and roll back. The schema matches the spec. The app refuses to start when the database is not at the migration head. Payment descriptions never reach error logs. |
+| `tests/db` | 14 | Migrations apply to an empty database and roll back. The schema matches the spec. The app refuses to start when the database is not at the migration head. Payment descriptions never reach error logs. |
 | `tests/api` | 63 | The HTTP contract. A1–A16 cover both samples from the task, every rejection code, the error format and the payment order. I1–I4 and I6–I9 cover idempotency. |
 | `tests/concurrency` | 18 | Races and locks; listed below. |
 
@@ -540,12 +540,12 @@ docker-compose.yml, Dockerfile, Makefile, pyproject.toml, uv.lock
 **How much time did you spend on this task?**
 
 - [ ] Less than 3h
-- [ ] 3h to 6h
+- [X] 3h to 6h
 - [ ] More than 6h (how long?)
 
 **How proud are you of your work?**
 
 - [ ] Very proud
-- [ ] Fairly proud
+- [X] Fairly proud
 - [ ] Good enough
 - [ ] Somewhat disappointed

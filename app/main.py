@@ -15,6 +15,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api import BULK_PAYMENTS_PATH, router
 from app.config import get_settings
+from app.db import get_engine
 from app.errors import DomainError, ServiceBusy, ValidationFailed
 from app.schemas import format_cents
 
@@ -44,6 +45,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # Synchronous endpoints wait for a thread instead of failing on pool checkout.
     # The limiter can be changed only from the event loop.
     anyio.to_thread.current_default_thread_limiter().total_tokens = get_settings().db_pool_size
+    # Built before the first request, so requests never race to create it.
+    get_engine()
     yield
 
 

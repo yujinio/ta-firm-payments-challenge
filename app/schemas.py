@@ -2,7 +2,10 @@ import re
 from typing import Annotated, TypedDict
 from uuid import UUID
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictStr
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictStr, field_validator
+from pydantic_core import PydanticCustomError
+
+from app.config import get_settings
 
 INT32_MAX = 2_147_483_647
 
@@ -61,12 +64,28 @@ class PaymentIn(BaseModel):
 
 
 class BulkPaymentRequest(BaseModel):
-    """The request body; limits that depend on settings are checked in build_command."""
+    """The request body; the description length limit is checked in build_command."""
 
     model_config = ConfigDict(extra="forbid")
 
     payer_firm_uuid: UUID
     payments: Annotated[list[PaymentIn], Field(min_length=1)]
+
+    @field_validator("payments", mode="before")
+    @classmethod
+    def _check_payment_count(cls, value: object) -> object:
+        """Reject a batch over MAX_PAYMENTS_PER_REQUEST before any of its items is validated.
+
+        An oversized batch then costs one error entry, not one entry per invalid item.
+        """
+        limit = get_settings().max_payments_per_request
+        if isinstance(value, list) and len(value) > limit:
+            raise PydanticCustomError(
+                "too_long",
+                "at most {limit} payments are allowed per request",
+                {"limit": limit},
+            )
+        return value
 
 
 class PaymentOut(TypedDict):

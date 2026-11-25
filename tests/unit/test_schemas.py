@@ -69,3 +69,18 @@ def test_lone_surrogate_in_raw_json_is_rejected():
 def test_sample_request_is_valid():
     request = BulkPaymentRequest.model_validate(SAMPLE_REQUEST)
     assert [p.amount for p in request.payments] == ["6250", "5800.5", "1200.75"]
+
+
+def test_payment_count_checked_before_items():
+    # 1001 items, each with an invalid amount: one too_long error, not 1001 amount errors.
+    payload = _request(payments=[{**SAMPLE_REQUEST["payments"][0], "amount": "x"}] * 1001)
+    with pytest.raises(ValidationError) as excinfo:
+        BulkPaymentRequest.model_validate(payload)
+    errors = excinfo.value.errors()
+    assert [(e["loc"], e["type"]) for e in errors] == [(("payments",), "too_long")]
+    assert errors[0]["msg"] == "at most 1000 payments are allowed per request"
+
+
+def test_payment_count_at_limit_accepted():
+    payload = _request(payments=[SAMPLE_REQUEST["payments"][0]] * 1000)
+    assert len(BulkPaymentRequest.model_validate(payload).payments) == 1000

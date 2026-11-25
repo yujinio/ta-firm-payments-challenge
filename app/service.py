@@ -74,11 +74,6 @@ def build_command(
 
     Pure: no database access. Raises ValidationFailed or SelfPayment.
     """
-    max_payments = settings.max_payments_per_request
-    if len(request.payments) > max_payments:
-        msg = f"at most {max_payments} payments are allowed per request"
-        raise ValidationFailed(msg, [_detail(["body", "payments"], msg, "too_long")])
-
     max_length = settings.max_description_length
     msg = f"description must be at most {max_length} characters long"
     too_long = [

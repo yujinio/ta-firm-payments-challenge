@@ -39,15 +39,6 @@ def test_self_payment_rejected(settings):
         build_command(_request(payload), None, settings)
 
 
-def test_too_many_payments(settings):
-    settings = settings.model_copy(update={"max_payments_per_request": 2})
-    build_command(_request(bulk(PINECREST, (NAIR, "1"), (LOPEZ, "2"))), None, settings)
-    payload = bulk(PINECREST, (NAIR, "1"), (LOPEZ, "2"), (NAIR, "3"))
-    with pytest.raises(ValidationFailed) as excinfo:
-        build_command(_request(payload), None, settings)
-    assert _error_locs(excinfo) == [["body", "payments"]]
-
-
 def test_description_too_long(settings):
     payload = bulk(PINECREST, (NAIR, "1"), (LOPEZ, "2"))
     payload["payments"][0]["description"] = "x" * 500

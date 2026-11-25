@@ -62,6 +62,19 @@ def test_a9_schema_violations(client, db, payload):
     assert balances(db) == before and payment_rows(db) == []
 
 
+def test_a9_payment_limit_checked_before_items(client):
+    # 1001 items with invalid amounts get one too_long detail, not one detail per item.
+    payload = bulk(PINECREST, *[(NAIR, "x")] * 1001)
+    error = assert_validation_error(client.post("/bulk-payments", json=payload))
+    assert error["details"] == [
+        {
+            "loc": ["body", "payments"],
+            "msg": "at most 1000 payments are allowed per request",
+            "type": "too_long",
+        }
+    ]
+
+
 NON_OBJECT_BODIES = {
     "array": (b"[]", JSON),
     "string": (b'"x"', JSON),

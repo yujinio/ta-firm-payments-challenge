@@ -566,7 +566,7 @@ Owner: the author, with an independent review in a new session (agent workflow s
 
 **Files:**
 - Create: `README.md`
-- Modify: `ai-logs/` (exported session logs, unedited)
+- Modify: `ai-logs/` (raw session transcripts with masking only, and an English translation of each session's dialogue)
 
 - [ ] **Step 1: Independent review.** Run the step 5 prompt from the agent work plan in a new session that has only the repository. Triage every finding: fix, or record in the README why not.
 
@@ -586,7 +586,7 @@ Expected: `201`; balances 3674875, 170075, 1405050. Repeat the `curl` three more
 
 `sample-request.json` and `format-example-request.json` were committed in Task 2.
 
-- [ ] **Step 4: Submission checklist** (spec section 14.3): commit history shows the progress; `ai-logs/` holds every working session, with only the account email and the home directory path masked; README sections are all present; assumptions and improvements match the spec.
+- [ ] **Step 4: Submission checklist** (spec section 14.3): commit history shows the progress; `ai-logs/raw/` holds every working session, with only the account email and the local user name masked, and `ai-logs/` has an English dialogue of each; README sections are all present; assumptions and improvements match the spec.
 
 - [ ] **Step 5: Commit.** `git commit -m "docs: README, sample request and AI session logs"`
 

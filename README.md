@@ -501,10 +501,12 @@ When something was ambiguous, the controller did not stop and wait. It made a ru
 
 Every commit carries a `Co-Authored-By` trailer naming the model of the session that made it. The design documents were written in the Fable design sessions but committed from the Opus controller session (fce9a5b), so that commit names Opus.
 
-**Logs.** `ai-logs/` holds the working sessions, with an index of their tool, model and role. They differ from the raw export in two ways:
+**Logs.** `ai-logs/` holds the sessions in two forms, with an index of their tool, model and role:
 
-- The account email and the home directory path are masked. Nothing else was edited.
-- Two aborted early attempts at starting the implementation are left out.
+- **To read:** the dialogue of each working session, translated from Russian into English. It has my messages, my answers to Claude's questions and Claude's replies, plus one line per turn on the tools, subagents and commits. Thinking and tool output are left out.
+- **Unedited, as the task asks:** the raw Claude Code transcripts in `ai-logs/raw/`, including every subagent's transcript.
+
+In both, the account email and the local user name are masked. Two aborted early attempts at starting the implementation are left out. The design sessions are not included, because they are not in the local Claude Code history: the specification and the plan, written with Fable 5.2.
 
 **Whose decisions.** I made the decisions marked **[R]** in the spec:
 
@@ -539,7 +541,7 @@ These were my own requests:
 
 | # | Finding | Outcome |
 |---|---|---|
-| 1 | `ai-logs/` was empty | The session logs go there before submission |
+| 1 | `ai-logs/` was empty | Filled: raw transcripts and an English dialogue of each session |
 | 2 | A clone gets `main`, which held only the docs | Resolved once the pull request is merged |
 | 3 | M2 is caught by behavioural tests in most runs, not in all, and the two-firm crossing over HTTP fails in some runs | Docs corrected; the statement-order test remains the deterministic guard |
 | 4 | The wait for a thread has no time limit | Documented with remedies (limitation 15) |

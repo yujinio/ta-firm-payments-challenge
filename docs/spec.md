@@ -646,7 +646,7 @@ Step 6 checks understanding of the task on the task's own data: the balance afte
 ### 14.3. Submission checklist
 
 - The commit history reflects the progress of the work.
-- `ai-logs/` contains the logs of the working sessions: the design sessions, the validation and execution session (with each subagent's transcript) and the review session. The only change to them is masking the account email and the home directory path. The README names the tools, says where each fit into the workflow, and states plainly what was masked and which sessions were left out (aborted early attempts).
+- `ai-logs/raw/` contains the logs of the working sessions: the validation and execution session (with each subagent's transcript) and the review session. The only change to them is masking the account email and the local user name. `ai-logs/` adds an English translation of each session's dialogue for reading. The README names the tools, says where each fit into the workflow, and states plainly what was masked and which sessions were left out (aborted early attempts).
 - The README contains: the solution and approach, encountered problems, assumptions, possible improvements, how to run and verify, answers to the two questions.
 - The assumptions section of the README matches section 4; the improvements section matches section 15.
 

@@ -1,0 +1,1 @@
+{"agentType":"general-purpose","isBuiltIn":true,"description":"Fact-check review triage changes","toolUseId":"toolu_01EPcYzD2YqE4hBLjoE7FTtd","spawnDepth":1,"requestShape":"background","requestNonInteractive":true,"model":"sonnet","pickedEffortModel":"claude-opus-5-5","finished":true}

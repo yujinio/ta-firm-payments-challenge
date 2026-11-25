@@ -46,7 +46,15 @@ Tasks 1–8 and the whole-branch review ran on 2026-11-24 on branch `feat/bulk-p
 - `make test`, `make lint` and `make load` run on the host through `uv run` (the author's decision). Task 1 originally ran them in a one-off `app` container. The recorded load runs used the in-container command.
 - Function and method signatures in `app/`, `scripts/` and `migrations/` are fully typed under mypy strict, and ruff requires docstrings on them. The largest test helpers and tests have them as well.
 - At the author's request, each replica checks at startup that `alembic_version` equals the migration head and exits otherwise (`app/schema_revision.py`, commit 90940af).
-- The README was drafted in the controller session at the author's request; the independent review (Task 9, Step 1) is still to run.
+- The README was drafted in the controller session at the author's request.
+- The independent review (Task 9, Step 1) ran on 2026-11-24 in a new Fable 5.2 session on a clean clone at 8c1107e. Its acceptance run passed, and it found no interleaving that breaks an invariant. The author settled its nine findings, and the controller applied them:
+  - the batch limit is checked before the items are validated (commit 7c84a37);
+  - a test covers the 503 from `/healthz` (b3860a3);
+  - the docs were corrected where the review disproved them: the M2 results, the two-firm case, and which probe results the tests re-confirm;
+  - the unbounded wait for a thread is documented with remedies;
+  - `/healthz`, `/docs`, `/redoc`, `/openapi.json`, the 307 redirect, the surrogate rule and the log's `status` field are added to the spec.
+
+  The README lists each finding and its outcome. The test count is now 162.
 
 ## Review Focus
 

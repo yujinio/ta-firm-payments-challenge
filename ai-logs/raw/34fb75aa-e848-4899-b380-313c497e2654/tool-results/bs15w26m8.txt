@@ -1,0 +1,992 @@
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..4a18d5c
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,7 @@
++.git
++.venv
++.superpowers
++__pycache__
++.*_cache
++docs
++ai-logs
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..301775c
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,13 @@
++name: ci
++
++on:
++  push:
++  pull_request:
++
++jobs:
++  check:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - run: docker compose up -d --wait db
++      - run: make check
+diff --git a/.python-version b/.python-version
+new file mode 100644
+index 0000000..6324d40
+--- /dev/null
++++ b/.python-version
+@@ -0,0 +1 @@
++3.14
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..722ff88
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,17 @@
++FROM python:3.14-slim
++
++COPY --from=ghcr.io/astral-sh/uv:0.13.9 /uv /usr/local/bin/uv
++
++ENV UV_COMPILE_BYTECODE=1 \
++    UV_LINK_MODE=copy \
++    UV_PYTHON_DOWNLOADS=never \
++    PATH="/app/.venv/bin:$PATH"
++
++WORKDIR /app
++
++COPY pyproject.toml uv.lock .python-version ./
++RUN uv sync --frozen --no-install-project
++
++COPY . .
++
++CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+diff --git a/Makefile b/Makefile
+new file mode 100644
+index 0000000..7478f90
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,33 @@
++TEST_DB_URL = postgresql+psycopg://postgres:postgres@db:5432/firm_payments_test
++LOAD_DB_URL = postgresql+psycopg://postgres:postgres@db:5432/firm_payments
++# make load ARGS="--scenario hot-payer --requests 2000 --concurrency 32"
++ARGS ?= --scenario uniform --requests 2000 --concurrency 32
++
++.PHONY: up seed reset test lint check load
++
++# nginx resolves the replicas only at start, and recreated replicas get new
++# addresses, so the balancer is restarted after every up.
++up:
++	docker compose up --build -d --wait
++	docker compose restart lb
++
++seed:
++	docker compose exec -T db psql -U postgres -d firm_payments < scripts/seed.sql
++
++reset:
++	docker compose exec -T db psql -U postgres -d firm_payments -v ON_ERROR_STOP=1 \
++		-c "TRUNCATE payments, idempotency_keys, firms RESTART IDENTITY CASCADE" -f - < scripts/seed.sql
++
++test:
++	docker compose run --rm --build -e TEST_DATABASE_URL=$(TEST_DB_URL) app pytest
++
++lint:
++	docker compose run --rm --build app sh -c "ruff check . && ruff format --check . && mypy app"
++
++check: test lint
++
++# Inside the Compose network, through the balancer. The script adds firms with ids
++# from 1000 and payments between them; `make reset` returns to the seed.
++load:
++	docker compose run --rm --build app python scripts/load.py \
++		--base-url http://lb --database-url $(LOAD_DB_URL) $(ARGS)
+diff --git a/ai-logs/.gitkeep b/ai-logs/.gitkeep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/alembic.ini b/alembic.ini
+new file mode 100644
+index 0000000..e719745
+--- /dev/null
++++ b/alembic.ini
+@@ -0,0 +1,25 @@
++[alembic]
++script_location = migrations
++prepend_sys_path = .
++path_separator = os
++
++[loggers]
++keys = root
++
++[handlers]
++keys = console
++
++[formatters]
++keys = generic
++
++[logger_root]
++level = WARNING
++handlers = console
++
++[handler_console]
++class = StreamHandler
++args = (sys.stderr,)
++formatter = generic
++
++[formatter_generic]
++format = %(levelname)-5.5s [%(name)s] %(message)s
+diff --git a/app/__init__.py b/app/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/app/api.py b/app/api.py
+new file mode 100644
+index 0000000..68c8f2e
+--- /dev/null
++++ b/app/api.py
+@@ -0,0 +1,50 @@
++from typing import Annotated
++
++from fastapi import APIRouter, Depends, Request, Response
++from fastapi.responses import JSONResponse
++from sqlalchemy import text
++from sqlalchemy.exc import SQLAlchemyError
++from sqlalchemy.orm import Session
++
++from app.config import Settings, get_settings
++from app.db import get_session
++from app.schemas import BulkPaymentRequest
++from app.service import build_command, execute_bulk_payment
++
++BULK_PAYMENTS_PATH = "/bulk-payments"
++
++router = APIRouter()
++
++
++@router.get("/healthz")
++def healthz(
++    response: Response, session: Annotated[Session, Depends(get_session)]
++) -> dict[str, str]:
++    try:
++        session.execute(text("SELECT 1"))
++    except SQLAlchemyError:
++        response.status_code = 503
++        return {"status": "unavailable"}
++    return {"status": "ok"}
++
++
++@router.post(BULK_PAYMENTS_PATH, status_code=201)
++def create_bulk_payment(
++    payload: BulkPaymentRequest,
++    request: Request,
++    session: Annotated[Session, Depends(get_session)],
++    settings: Annotated[Settings, Depends(get_settings)],
++) -> JSONResponse:
++    # Fields for the per-request log record written in app.main.
++    request.state.payer = str(payload.payer_firm_uuid)
++    request.state.payment_count = len(payload.payments)
++    # Spec 8.1: if the header is sent more than once, the first value is used.
++    keys = request.headers.getlist("Idempotency-Key")
++    command = build_command(payload, keys[0] if keys else None, settings)
++    request.state.total_cents = command.total_cents
++
++    result = execute_bulk_payment(session, command, settings.lock_timeout_ms)
++    request.state.outcome = "replayed" if result.replayed else "created"
++    # The original and the replay are serialized the same way, so the bytes match.
++    headers = {"Idempotent-Replayed": "true"} if result.replayed else None
++    return JSONResponse(result.body, status_code=201, headers=headers)
+diff --git a/app/config.py b/app/config.py
+new file mode 100644
+index 0000000..2045f24
+--- /dev/null
++++ b/app/config.py
+@@ -0,0 +1,17 @@
++from functools import lru_cache
++
++from pydantic_settings import BaseSettings
++
++
++class Settings(BaseSettings):
++    database_url: str
++    max_payments_per_request: int = 1000
++    max_description_length: int = 500
++    lock_timeout_ms: int = 5000
++    db_pool_size: int = 10
++    db_pool_timeout_s: int = 5
++
++
++@lru_cache
++def get_settings() -> Settings:
++    return Settings()
+diff --git a/app/db.py b/app/db.py
+new file mode 100644
+index 0000000..73ce91d
+--- /dev/null
++++ b/app/db.py
+@@ -0,0 +1,43 @@
++import threading
++from collections.abc import Iterator
++
++from sqlalchemy import Engine, create_engine
++from sqlalchemy.orm import Session, sessionmaker
++
++from app.config import get_settings
++
++# One engine per process: its pool bounds the process's connections (spec section 9.3).
++# lru_cache would not do: concurrent first calls each run the wrapped function.
++_engine: Engine | None = None
++_engine_lock = threading.Lock()
++
++
++def _create_engine() -> Engine:
++    settings = get_settings()
++    return create_engine(
++        settings.database_url,
++        pool_size=settings.db_pool_size,
++        max_overflow=0,
++        pool_timeout=settings.db_pool_timeout_s,
++        pool_pre_ping=True,
++        # Error text must not carry bound parameters: they include payment
++        # descriptions, which never go to logs (spec section 12).
++        hide_parameters=True,
++    )
++
++
++def get_engine() -> Engine:
++    global _engine
++    engine = _engine
++    if engine is None:
++        with _engine_lock:
++            if _engine is None:
++                _engine = _create_engine()
++            engine = _engine
++    return engine
++
++
++def get_session() -> Iterator[Session]:
++    factory = sessionmaker(bind=get_engine(), expire_on_commit=False)
++    with factory() as session:
++        yield session
+diff --git a/app/errors.py b/app/errors.py
+new file mode 100644
+index 0000000..20c0b03
+--- /dev/null
++++ b/app/errors.py
+@@ -0,0 +1,45 @@
++from typing import Any, ClassVar
++
++
++class DomainError(Exception):
++    """A rejection with a stable error code; the HTTP layer maps it to a response."""
++
++    code: ClassVar[str]
++    status_code: ClassVar[int] = 422
++
++    def __init__(self, message: str) -> None:
++        super().__init__(message)
++        self.message = message
++
++
++class ValidationFailed(DomainError):
++    code = "validation_error"
++
++    def __init__(self, message: str, details: list[dict[str, Any]]) -> None:
++        super().__init__(message)
++        self.details = details
++
++
++class SelfPayment(DomainError):
++    code = "self_payment"
++
++
++class FirmNotFound(DomainError):
++    code = "firm_not_found"
++
++
++class InsufficientFunds(DomainError):
++    code = "insufficient_funds"
++
++
++class BalanceOverflow(DomainError):
++    code = "balance_overflow"
++
++
++class IdempotencyKeyReuse(DomainError):
++    code = "idempotency_key_reuse"
++
++
++class ServiceBusy(DomainError):
++    code = "busy"
++    status_code = 503
+diff --git a/app/idempotency.py b/app/idempotency.py
+new file mode 100644
+index 0000000..264505b
+--- /dev/null
++++ b/app/idempotency.py
+@@ -0,0 +1,68 @@
++import hashlib
++import json
++from collections.abc import Sequence
++from typing import Any, cast
++
++from sqlalchemy import select, update
++from sqlalchemy.dialects.postgresql import insert
++from sqlalchemy.orm import Session
++
++from app.errors import IdempotencyKeyReuse
++from app.models import IdempotencyKey
++
++
++def compute_request_hash(payer_uuid: str, items: Sequence[tuple[str, int, str]]) -> str:
++    """SHA-256 of the parsed request; items are (payee_uuid, amount_cents, description).
++
++    The canonical form must never change: stored hashes have to stay comparable.
++    """
++    canonical = json.dumps(
++        {"payer": payer_uuid, "payments": [list(item) for item in items]},
++        sort_keys=True,
++        separators=(",", ":"),
++        ensure_ascii=False,
++    )
++    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
++
++
++def claim_key(
++    session: Session, payer_uuid: str, key: str, request_hash: str
++) -> dict[str, Any] | None:
++    """Claim the key for this transaction, or return the response stored under it.
++
++    Returns None when the key is new. If another transaction holds an uncommitted
++    row for the key, the insert waits for its outcome (bounded by lock_timeout):
++    after a commit the stored response is returned, after a rollback the key is
++    claimed here.
++    """
++    claimed_id = session.execute(
++        # response_body is left out: SQLAlchemy's JSON type would store None as JSON null.
++        insert(IdempotencyKey)
++        .values(payer_firm_uuid=payer_uuid, key=key, request_hash=request_hash)
++        .on_conflict_do_nothing(index_elements=["payer_firm_uuid", "key"])
++        .returning(IdempotencyKey.id)
++    ).scalar_one_or_none()
++    if claimed_id is not None:
++        return None
++
++    # A new statement: under Read Committed it sees the row that won the conflict.
++    existing = session.execute(
++        select(IdempotencyKey.request_hash, IdempotencyKey.response_body).where(
++            IdempotencyKey.payer_firm_uuid == payer_uuid, IdempotencyKey.key == key
++        )
++    ).one()
++    if existing.response_body is None:
++        # The row and its response are committed together, so this cannot happen.
++        raise RuntimeError("a committed idempotency key has no stored response")
++    if existing.request_hash != request_hash:
++        raise IdempotencyKeyReuse("the Idempotency-Key was already used with a different request")
++    return cast(dict[str, Any], existing.response_body)
++
++
++def store_response(session: Session, payer_uuid: str, key: str, body: dict[str, Any]) -> None:
++    """Store the 201 body under a key this transaction has claimed."""
++    session.execute(
++        update(IdempotencyKey)
++        .where(IdempotencyKey.payer_firm_uuid == payer_uuid, IdempotencyKey.key == key)
++        .values(response_body=body)
++    )
+diff --git a/app/main.py b/app/main.py
+new file mode 100644
+index 0000000..545ba03
+--- /dev/null
++++ b/app/main.py
+@@ -0,0 +1,152 @@
++import json
++import logging
++import socket
++import time
++import uuid
++from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
++from contextlib import asynccontextmanager
++from typing import Any
++
++import anyio.to_thread
++from fastapi import FastAPI, Request, Response
++from fastapi.exceptions import RequestValidationError
++from fastapi.responses import JSONResponse
++from starlette.exceptions import HTTPException as StarletteHTTPException
++
++from app.api import BULK_PAYMENTS_PATH, router
++from app.config import get_settings
++from app.db import get_engine
++from app.errors import DomainError, ServiceBusy, ValidationFailed
++from app.schemas import format_cents
++
++INSTANCE = socket.gethostname()
++
++request_logger = logging.getLogger("app.requests")
++
++_HTTP_ERROR_CODES = {404: "not_found", 405: "method_not_allowed"}
++
++# Pydantic messages that quote part of the input ("found `z` at 0"), by error type.
++_FIXED_MESSAGES = {"uuid_parsing": "Input should be a valid UUID"}
++
++
++def _configure_logging() -> None:
++    # Uvicorn configures only its own loggers; without a handler INFO records are dropped.
++    app_logger = logging.getLogger("app")
++    if not app_logger.handlers:
++        handler = logging.StreamHandler()
++        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
++        app_logger.addHandler(handler)
++        app_logger.setLevel(logging.INFO)
++
++
++@asynccontextmanager
++async def lifespan(_: FastAPI) -> AsyncIterator[None]:
++    _configure_logging()
++    # Synchronous endpoints wait for a thread instead of failing on pool checkout.
++    # The limiter can be changed only from the event loop.
++    anyio.to_thread.current_default_thread_limiter().total_tokens = get_settings().db_pool_size
++    # Built before the first request, so requests never race to create it.
++    get_engine()
++    yield
++
++
++async def log_request(
++    request: Request, call_next: Callable[[Request], Awaitable[Response]]
++) -> Response:
++    """Write one record per bulk payment request; descriptions are never logged."""
++    if request.url.path != BULK_PAYMENTS_PATH:
++        return await call_next(request)
++    started = time.perf_counter()
++    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
++    status = 500
++    try:
++        response = await call_next(request)
++        status = response.status_code
++        return response
++    finally:
++        state = request.state
++        total_cents = getattr(state, "total_cents", None)
++        record = {
++            "request_id": request_id,
++            "instance": INSTANCE,
++            "payer": getattr(state, "payer", None),
++            "payments": getattr(state, "payment_count", None),
++            "total": None if total_cents is None else format_cents(total_cents),
++            # Unset only when an exception escaped to the 500 handler.
++            "outcome": getattr(state, "outcome", "internal_error"),
++            "status": status,
++            "duration_ms": round((time.perf_counter() - started) * 1000, 1),
++        }
++        request_logger.info(json.dumps(record))
++
++
++def _error_response(
++    request: Request,
++    status_code: int,
++    code: str,
++    message: str,
++    *,
++    details: list[dict[str, Any]] | None = None,
++    headers: Mapping[str, str] | None = None,
++) -> JSONResponse:
++    request.state.outcome = code
++    error: dict[str, Any] = {"code": code, "message": message}
++    if details is not None:
++        error["details"] = details
++    return JSONResponse({"error": error}, status_code=status_code, headers=headers)
++
++
++async def handle_domain_error(request: Request, exc: DomainError) -> JSONResponse:
++    details = exc.details if isinstance(exc, ValidationFailed) else None
++    headers = {"Retry-After": "1"} if isinstance(exc, ServiceBusy) else None
++    return _error_response(
++        request, exc.status_code, exc.code, exc.message, details=details, headers=headers
++    )
++
++
++async def handle_request_validation_error(
++    request: Request, exc: RequestValidationError
++) -> JSONResponse:
++    # Only loc, msg and type: input and ctx carry the rejected value, which may be
++    # sensitive or impossible to encode (a lone surrogate from a \ud800 escape).
++    details = [
++        {
++            "loc": list(error["loc"]),
++            "msg": _FIXED_MESSAGES.get(error["type"], error["msg"]),
++            "type": error["type"],
++        }
++        for error in exc.errors()
++    ]
++    return _error_response(
++        request, 422, "validation_error", "the request is invalid", details=details
++    )
++
++
++async def handle_http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:
++    if exc.status_code == 400:
++        # FastAPI raises 400 only when it cannot read the body as JSON, for
++        # example invalid UTF-8; spec section 8.1 makes that a validation error.
++        message = "the request body is not valid JSON"
++        detail = {"loc": ["body"], "msg": message, "type": "json_invalid"}
++        return _error_response(request, 422, "validation_error", message, details=[detail])
++    code = _HTTP_ERROR_CODES.get(exc.status_code, "http_error")
++    return _error_response(request, exc.status_code, code, str(exc.detail), headers=exc.headers)
++
++
++async def handle_internal_error(request: Request, exc: Exception) -> JSONResponse:
++    # Uvicorn logs the traceback; the client learns nothing about the cause.
++    return _error_response(request, 500, "internal_error", "internal server error")
++
++
++def create_app() -> FastAPI:
++    application = FastAPI(lifespan=lifespan)
++    application.include_router(router)
++    application.middleware("http")(log_request)
++    application.exception_handler(DomainError)(handle_domain_error)
++    application.exception_handler(RequestValidationError)(handle_request_validation_error)
++    application.exception_handler(StarletteHTTPException)(handle_http_exception)
++    application.exception_handler(Exception)(handle_internal_error)
++    return application
++
++
++app = create_app()
+diff --git a/app/models.py b/app/models.py
+new file mode 100644
+index 0000000..03327e2
+--- /dev/null
++++ b/app/models.py
+@@ -0,0 +1,51 @@
++from datetime import datetime
++from typing import Any
++
++from sqlalchemy import (
++    JSON,
++    BigInteger,
++    DateTime,
++    ForeignKey,
++    Identity,
++    Integer,
++    Text,
++    UniqueConstraint,
++    func,
++)
++from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
++
++
++class Base(DeclarativeBase):
++    pass
++
++
++class Firm(Base):
++    __tablename__ = "firms"
++    __table_args__ = (UniqueConstraint("uuid", name="uq_firms_uuid"),)
++
++    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
++    name: Mapped[str] = mapped_column(Text)
++    balance_cents: Mapped[int] = mapped_column(Integer)
++    uuid: Mapped[str] = mapped_column(Text)
++
++
++class Payment(Base):
++    __tablename__ = "payments"
++
++    id: Mapped[int] = mapped_column(Integer, Identity(always=False), primary_key=True)
++    payer_firm_id: Mapped[int] = mapped_column(ForeignKey("firms.id"))
++    payee_firm_id: Mapped[int] = mapped_column(ForeignKey("firms.id"))
++    amount_cents: Mapped[int] = mapped_column(Integer)
++    description: Mapped[str] = mapped_column(Text)
++
++
++class IdempotencyKey(Base):
++    __tablename__ = "idempotency_keys"
++    __table_args__ = (UniqueConstraint("payer_firm_uuid", "key", name="uq_idempotency_keys"),)
++
++    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
++    payer_firm_uuid: Mapped[str] = mapped_column(Text)
++    key: Mapped[str] = mapped_column(Text)
++    request_hash: Mapped[str] = mapped_column(Text)
++    response_body: Mapped[Any | None] = mapped_column(JSON, nullable=True)
++    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+diff --git a/app/schemas.py b/app/schemas.py
+new file mode 100644
+index 0000000..1c51d10
+--- /dev/null
++++ b/app/schemas.py
+@@ -0,0 +1,65 @@
++import re
++from typing import Annotated
++from uuid import UUID
++
++from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictStr
++
++INT32_MAX = 2_147_483_647
++
++# 8 integer digits, a point and 2 decimals is the longest amount that fits INT32_MAX cents.
++_MAX_AMOUNT_LENGTH = 11
++# [0-9], not \d: \d also matches digits from other scripts.
++_AMOUNT_PATTERN = re.compile(r"[0-9]+(\.[0-9]{1,2})?")
++
++
++def parse_amount_cents(value: str) -> int:
++    """Convert a decimal amount string such as "5800.5" to integer cents."""
++    if len(value) > _MAX_AMOUNT_LENGTH:
++        raise ValueError(f"amount must be at most {_MAX_AMOUNT_LENGTH} characters long")
++    if _AMOUNT_PATTERN.fullmatch(value) is None:
++        raise ValueError("amount must be digits with an optional point and 1 or 2 decimals")
++    whole, _, fraction = value.partition(".")
++    cents = int(whole) * 100 + int(fraction.ljust(2, "0"))
++    if not 0 < cents <= INT32_MAX:
++        raise ValueError(f"amount must be greater than 0 and at most {format_cents(INT32_MAX)}")
++    return cents
++
++
++def format_cents(cents: int) -> str:
++    """Render non-negative integer cents as a decimal string with exactly two decimals."""
++    return f"{cents // 100}.{cents % 100:02d}"
++
++
++def _check_amount(value: str) -> str:
++    parse_amount_cents(value)
++    return value
++
++
++def _check_description(value: str) -> str:
++    # PostgreSQL TEXT cannot store U+0000.
++    if "\x00" in value:
++        raise ValueError("description must not contain the character U+0000")
++    # A lone surrogate (from a JSON escape such as \ud800) cannot be encoded
++    # for the request hash or the database.
++    try:
++        value.encode("utf-8")
++    except UnicodeEncodeError:
++        raise ValueError("description must not contain unpaired surrogates") from None
++    return value
++
++
++class PaymentIn(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++
++    amount: Annotated[StrictStr, AfterValidator(_check_amount)]
++    payee_firm_uuid: UUID
++    description: Annotated[StrictStr, AfterValidator(_check_description)]
++
++
++class BulkPaymentRequest(BaseModel):
++    """The request body; limits that depend on settings are checked in build_command."""
++
++    model_config = ConfigDict(extra="forbid")
++
++    payer_firm_uuid: UUID
++    payments: Annotated[list[PaymentIn], Field(min_length=1)]
+diff --git a/app/service.py b/app/service.py
+new file mode 100644
+index 0000000..e39284c
+--- /dev/null
++++ b/app/service.py
+@@ -0,0 +1,229 @@
++import logging
++import re
++from dataclasses import dataclass
++from typing import Any
++
++from sqlalchemy import select, text
++from sqlalchemy.exc import DBAPIError
++from sqlalchemy.exc import TimeoutError as PoolTimeoutError
++from sqlalchemy.orm import Session
++
++from app.config import Settings
++from app.errors import (
++    BalanceOverflow,
++    FirmNotFound,
++    InsufficientFunds,
++    SelfPayment,
++    ServiceBusy,
++    ValidationFailed,
++)
++from app.idempotency import claim_key, compute_request_hash, store_response
++from app.models import Firm, Payment
++from app.schemas import INT32_MAX, BulkPaymentRequest, format_cents, parse_amount_cents
++
++logger = logging.getLogger(__name__)
++
++_LOCK_NOT_AVAILABLE = "55P03"
++_DEADLOCK_DETECTED = "40P01"
++
++# Visible ASCII, no spaces.
++_IDEMPOTENCY_KEY_PATTERN = re.compile(r"[\x21-\x7e]{1,255}")
++
++
++@dataclass(frozen=True)
++class PaymentItem:
++    payee_uuid: str
++    amount_cents: int
++    description: str
++
++
++@dataclass(frozen=True)
++class BulkPaymentCommand:
++    payer_uuid: str
++    items: tuple[PaymentItem, ...]
++    total_cents: int
++    credits: dict[str, int]
++    firm_uuids: frozenset[str]
++    idempotency_key: str | None
++    request_hash: str | None
++
++
++def _detail(loc: list[str | int], msg: str, type_: str) -> dict[str, Any]:
++    return {"loc": loc, "msg": msg, "type": type_}
++
++
++def build_command(
++    request: BulkPaymentRequest, idempotency_key: str | None, settings: Settings
++) -> BulkPaymentCommand:
++    """Check the rules the schema cannot and derive what the transaction needs.
++
++    Pure: no database access.
++    """
++    max_payments = settings.max_payments_per_request
++    if len(request.payments) > max_payments:
++        msg = f"at most {max_payments} payments are allowed per request"
++        raise ValidationFailed(msg, [_detail(["body", "payments"], msg, "too_long")])
++
++    max_length = settings.max_description_length
++    msg = f"description must be at most {max_length} characters long"
++    too_long = [
++        _detail(["body", "payments", index, "description"], msg, "string_too_long")
++        for index, payment in enumerate(request.payments)
++        if len(payment.description) > max_length
++    ]
++    if too_long:
++        raise ValidationFailed(msg, too_long)
++
++    if idempotency_key is not None and _IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
++        msg = "Idempotency-Key must be 1 to 255 visible ASCII characters without spaces"
++        detail = _detail(["header", "Idempotency-Key"], msg, "string_pattern_mismatch")
++        raise ValidationFailed(msg, [detail])
++
++    payer_uuid = str(request.payer_firm_uuid)
++    items = tuple(
++        PaymentItem(
++            payee_uuid=str(payment.payee_firm_uuid),
++            amount_cents=parse_amount_cents(payment.amount),
++            description=payment.description,
++        )
++        for payment in request.payments
++    )
++
++    for index, item in enumerate(items):
++        if item.payee_uuid == payer_uuid:
++            raise SelfPayment(f"payment {index} pays the payer itself")
++
++    total_cents = sum(item.amount_cents for item in items)
++    if total_cents > INT32_MAX:
++        msg = f"the batch total must be at most {format_cents(INT32_MAX)}"
++        raise ValidationFailed(msg, [_detail(["body", "payments"], msg, "less_than_equal")])
++
++    credits: dict[str, int] = {}
++    for item in items:
++        credits[item.payee_uuid] = credits.get(item.payee_uuid, 0) + item.amount_cents
++
++    firm_uuids = frozenset({payer_uuid, *credits})
++
++    request_hash = None
++    if idempotency_key is not None:
++        request_hash = compute_request_hash(
++            payer_uuid, [(item.payee_uuid, item.amount_cents, item.description) for item in items]
++        )
++
++    return BulkPaymentCommand(
++        payer_uuid=payer_uuid,
++        items=items,
++        total_cents=total_cents,
++        credits=credits,
++        firm_uuids=firm_uuids,
++        idempotency_key=idempotency_key,
++        request_hash=request_hash,
++    )
++
++
++@dataclass(frozen=True)
++class BulkPaymentResult:
++    body: dict[str, Any]
++    replayed: bool
++
++
++def execute_bulk_payment(
++    session: Session, command: BulkPaymentCommand, lock_timeout_ms: int
++) -> BulkPaymentResult:
++    """Apply the whole batch in one transaction, or reject it and change nothing.
++
++    The session must not be in a transaction yet; this function owns it.
++    """
++    try:
++        with session.begin():
++            result = _apply(session, command, lock_timeout_ms)
++    except DBAPIError as exc:
++        sqlstate = getattr(exc.orig, "sqlstate", None)
++        if sqlstate == _DEADLOCK_DETECTED:
++            # Locks are taken in one query ordered by id, so this should not happen.
++            # exc.orig, not exc: the SQLAlchemy message carries the statement
++            # parameters, and those include payment descriptions.
++            logger.error("deadlock detected in a bulk payment transaction: %s", exc.orig)
++        if sqlstate in (_LOCK_NOT_AVAILABLE, _DEADLOCK_DETECTED):
++            raise ServiceBusy("the payment could not be processed in time; retry") from exc
++        raise
++    except PoolTimeoutError as exc:
++        raise ServiceBusy("no database connection is available; retry") from exc
++    return result
++
++
++def _apply(
++    session: Session, command: BulkPaymentCommand, lock_timeout_ms: int
++) -> BulkPaymentResult:
++    """Transaction steps of spec section 8.2; only database work happens here."""
++    session.execute(
++        text("SELECT set_config('lock_timeout', :value, true)"),
++        {"value": f"{lock_timeout_ms}ms"},
++    )
++
++    key = command.idempotency_key
++    if key is not None:
++        assert command.request_hash is not None  # build_command sets both or neither
++        # Claimed before any firm is read: a second request with this key waits
++        # here for the outcome of the first.
++        stored = claim_key(session, command.payer_uuid, key, command.request_hash)
++        if stored is not None:
++            return BulkPaymentResult(body=stored, replayed=True)
++
++    # The only read of firms: it finds, checks and locks them in one consistent order.
++    locked = session.scalars(
++        select(Firm)
++        .where(Firm.uuid.in_(command.firm_uuids))
++        .order_by(Firm.id)
++        .with_for_update(key_share=True)
++        .execution_options(populate_existing=True)
++    ).all()
++    firms = {firm.uuid: firm for firm in locked}
++
++    missing = command.firm_uuids - firms.keys()
++    if missing:
++        raise FirmNotFound(f"firms not found: {', '.join(sorted(missing))}")
++
++    payer = firms[command.payer_uuid]
++    if payer.balance_cents < command.total_cents:
++        raise InsufficientFunds("the payer's balance does not cover the batch total")
++
++    for payee_uuid, credit in command.credits.items():
++        if firms[payee_uuid].balance_cents + credit > INT32_MAX:
++            raise BalanceOverflow(f"the balance of payee {payee_uuid} would exceed the maximum")
++
++    rows = [
++        Payment(
++            payer_firm_id=payer.id,
++            payee_firm_id=firms[item.payee_uuid].id,
++            amount_cents=item.amount_cents,
++            description=item.description,
++        )
++        for item in command.items
++    ]
++    session.add_all(rows)
++    session.flush()
++
++    payer.balance_cents -= command.total_cents
++    for payee_uuid, credit in command.credits.items():
++        firms[payee_uuid].balance_cents += credit
++
++    body: dict[str, Any] = {
++        "payer_firm_uuid": command.payer_uuid,
++        "total_amount": format_cents(command.total_cents),
++        "payments": [
++            {
++                "id": row.id,
++                "payee_firm_uuid": item.payee_uuid,
++                "amount": format_cents(item.amount_cents),
++                "description": item.description,
++            }
++            for row, item in zip(rows, command.items, strict=True)
++        ],
++    }
++
++    if key is not None:
++        # Balance updates go out first, so storing the response is the last statement.
++        session.flush()
++        store_response(session, command.payer_uuid, key, body)
++    return BulkPaymentResult(body=body, replayed=False)
+diff --git a/deploy/nginx.conf b/deploy/nginx.conf
+new file mode 100644
+index 0000000..42a7e36
+--- /dev/null
++++ b/deploy/nginx.conf
+@@ -0,0 +1,15 @@
++upstream app {
++    # The name resolves to every replica of the app service.
++    server app:8000;
++}
++
++server {
++    listen 80;
++
++    location / {
++        proxy_pass http://app;
++        proxy_connect_timeout 2s;
++        proxy_set_header X-Request-Id $request_id;
++        add_header X-Upstream $upstream_addr always;
++    }
++}
+diff --git a/docker-compose.yml b/docker-compose.yml
+new file mode 100644
+index 0000000..f7ddbca
+--- /dev/null
++++ b/docker-compose.yml
+@@ -0,0 +1,53 @@
++services:
++  db:
++    image: postgres:18
++    environment:
++      POSTGRES_PASSWORD: postgres
++      POSTGRES_DB: firm_payments
++    ports:
++      - "127.0.0.1:5432:5432"
++    volumes:
++      - ./scripts/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
++    healthcheck:
++      test: ["CMD-SHELL", "pg_isready -U postgres -d firm_payments"]
++      interval: 2s
++      timeout: 3s
++      retries: 30
++
++  migrate:
++    build: .
++    image: firm-payments
++    command: alembic upgrade head
++    environment:
++      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/firm_payments
++    restart: "no"
++    depends_on:
++      db:
++        condition: service_healthy
++
++  app:
++    build: .
++    image: firm-payments
++    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
++    environment:
++      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/firm_payments
++    deploy:
++      replicas: 3
++    depends_on:
++      migrate:
++        condition: service_completed_successfully
++    healthcheck:
++      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
++      interval: 2s
++      timeout: 3s
++      retries: 30
++
++  lb:
++    image: nginx:stable
++    ports:
++      - "8000:80"
++    volumes:
++      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
++    depends_on:
++      app:
++        condition: service_healthy

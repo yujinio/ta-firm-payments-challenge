@@ -1,0 +1,381 @@
+=== m1 run 1
+        # The thread is joined only after the other transaction has ended, so a failed
+FAILED tests/concurrency/test_locks.py::test_c4_request_waits_for_row_lock - ...
+FAILED tests/concurrency/test_locks.py::test_statement_order[with_key] - Asse...
+FAILED tests/concurrency/test_locks.py::test_statement_order[without_key] - A...
+FAILED tests/concurrency/test_multiprocess.py::test_c7_one_payer_over_http - ...
+FAILED tests/concurrency/test_multiprocess.py::test_c7_crossing_over_http - a...
+FAILED tests/concurrency/test_races.py::test_c1_one_payer_many_batches - Asse...
+FAILED tests/concurrency/test_races.py::test_c2_crossing_payments - assert (1...
+FAILED tests/concurrency/test_races.py::test_c3_cycle_and_random_mix - Assert...
+FAILED tests/concurrency/test_races.py::test_c6_hot_payee - assert 201000 == ...
+9 failed, 9 passed in 4.69s
+=== m1 run 2
+        # The thread is joined only after the other transaction has ended, so a failed
+FAILED tests/concurrency/test_locks.py::test_c4_request_waits_for_row_lock - ...
+FAILED tests/concurrency/test_locks.py::test_statement_order[with_key] - Asse...
+FAILED tests/concurrency/test_locks.py::test_statement_order[without_key] - A...
+FAILED tests/concurrency/test_multiprocess.py::test_c7_one_payer_over_http - ...
+FAILED tests/concurrency/test_multiprocess.py::test_c7_crossing_over_http - a...
+FAILED tests/concurrency/test_races.py::test_c1_one_payer_many_batches - Asse...
+FAILED tests/concurrency/test_races.py::test_c2_crossing_payments - assert (1...
+FAILED tests/concurrency/test_races.py::test_c3_cycle_and_random_mix - Assert...
+FAILED tests/concurrency/test_races.py::test_c6_hot_payee - assert 202000 == ...
+9 failed, 9 passed in 3.56s
+=== m2 run 1
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+FAILED tests/concurrency/test_locks.py::test_statement_order[with_key] - Asse...
+FAILED tests/concurrency/test_locks.py::test_statement_order[without_key] - A...
+FAILED tests/concurrency/test_multiprocess.py::test_c7_crossing_over_http - A...
+FAILED tests/concurrency/test_races.py::test_c3_cycle_and_random_mix - Assert...
+4 failed, 14 passed in 21.55s
+=== m2 run 2
+FAILED tests/concurrency/test_locks.py::test_statement_order[with_key] - Asse...
+FAILED tests/concurrency/test_locks.py::test_statement_order[without_key] - A...
+2 failed, 16 passed in 5.41s
+=== m3 run 1
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+FAILED tests/concurrency/test_locks.py::test_statement_order[with_key] - Asse...
+FAILED tests/concurrency/test_locks.py::test_statement_order[without_key] - A...
+FAILED tests/concurrency/test_multiprocess.py::test_c7_crossing_over_http - A...
+FAILED tests/concurrency/test_races.py::test_c2_crossing_payments - Assertion...
+FAILED tests/concurrency/test_races.py::test_c3_cycle_and_random_mix - Assert...
+5 failed, 13 passed in 78.40s (0:01:18)
+=== m3 run 2
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+ERROR    app.service:service.py:166 deadlock detected in a bulk payment transaction: deadlock detected
+FAILED tests/concurrency/test_locks.py::test_statement_order[with_key] - Asse...
+FAILED tests/concurrency/test_locks.py::test_statement_order[without_key] - A...
+FAILED tests/concurrency/test_multiprocess.py::test_c7_crossing_over_http - A...
+FAILED tests/concurrency/test_races.py::test_c2_crossing_payments - Assertion...
+FAILED tests/concurrency/test_races.py::test_c3_cycle_and_random_mix - Assert...
+5 failed, 13 passed in 72.98s (0:01:12)

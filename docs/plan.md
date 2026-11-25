@@ -6,9 +6,9 @@
 
 **Architecture:** A synchronous FastAPI app over PostgreSQL. One database transaction per request: claim the idempotency key, lock every firm in the batch with a single `ORDER BY id ... FOR NO KEY UPDATE` query, check the balance in Python, insert payments, update balances, commit. No in-process state; all coordination is in the database. The run stand is Docker Compose: PostgreSQL, a one-shot migration service, three application replicas and an nginx balancer.
 
-**Tech Stack:** Python 3.14, FastAPI, Uvicorn, Pydantic v2, pydantic-settings, SQLAlchemy 2.x (sync), psycopg 3, Alembic, PostgreSQL 18, pytest, httpx, ruff, mypy, uv, Docker Compose, nginx.
+**Tech Stack:** Python 3.14, FastAPI, Uvicorn, Pydantic v2, pydantic-settings, SQLAlchemy 2.x (sync), psycopg 3, Alembic, PostgreSQL 18, pytest, httpx2, ruff, mypy, uv, Docker Compose, nginx.
 
-**Spec:** `docs/spec.md`, revision 4 (read it in full before any task; section numbers below refer to it).
+**Spec:** `docs/spec.md`, revision 4 when the plan was executed; revision 5 adds what the implementation found (read it in full before any task; section numbers below refer to it).
 
 **Location in repository:** `docs/plan.md`
 
@@ -23,7 +23,7 @@
 - No firm row is read before the locking query.
 - Tests run against real PostgreSQL only. The schema under test is created by `alembic upgrade head`, never by `metadata.create_all`.
 - Defaults: `MAX_PAYMENTS_PER_REQUEST=1000`, `MAX_DESCRIPTION_LENGTH=500`, `LOCK_TIMEOUT_MS=5000`, `DB_POOL_SIZE=10`, `DB_POOL_TIMEOUT_S=5`.
-- The run stand has four services: `db` (published on `127.0.0.1:5432` for host-side tests), `migrate` (one-shot), `app` (three replicas, one Uvicorn process each, no published port) and `lb` (nginx, published on host port 8000). Replicas never run migrations.
+- The run stand has four services: `db` (published on `127.0.0.1:${DB_PORT:-5432}` for host-side tests), `migrate` (one-shot), `app` (three replicas, one Uvicorn process each, no published port) and `lb` (nginx, published on `127.0.0.1:${LB_PORT:-8000}`). Replicas never run migrations.
 - The local container runtime is Podman 5.8 behind the `docker` command, with Docker Compose v5.1 as the compose provider (spec section 13.8). Write the Compose file for Docker Engine; if Podman behaves differently, report it with evidence instead of working around it.
 - `app/api.py` contains no SQL; `app/service.py` imports nothing from FastAPI.
 - Code, comments, commit messages and README are in English. One logical change per commit.
@@ -32,6 +32,29 @@
 ## Spec Revision
 
 This plan implements revision 4 of the spec. The spec already contains the rules found while planning (no U+0000 in descriptions, the key character set, the 11-character cap on amounts, the thread limit, the `JSON` column type), the results of the design probes (section 17), the run stand (section 5.6) and the justified batch limit (section 5.7). Revision 4 adds the page-3 request as a second sample (test A16, `make reset`), the published database port, the pinned Python version and the note on the local Podman runtime. Nothing in this plan overrides the spec.
+
+## Execution Record
+
+Tasks 1–8 and the whole-branch review ran on 2026-11-24 on branch `feat/bulk-payment-service`, in one controller session under superpowers:subagent-driven-development. The task text below has been updated where the result differs from what was planned; the differences are:
+
+- `httpx2` replaces `httpx` as the test client dependency: Starlette's test client imports it.
+- Routing errors use the single error format with codes `not_found` (404), `method_not_allowed` (405) and `http_error`; a body that is not valid UTF-8 is a 422 `validation_error`, not a 400.
+- Descriptions never reach logs: the engine is created with `hide_parameters=True`, and the deadlock log line logs the driver error, not the SQLAlchemy message.
+- `make up` restarts `lb` after `docker compose up`, because nginx resolves the replica addresses only at start.
+- Task 8 found that `functools.lru_cache` let concurrent first calls to `get_engine()` build several engines, so a process could hold more connections than `DB_POOL_SIZE`. Commit 2639070 builds the engine once per process, under a lock and at startup.
+- The whole-branch review led to a fix wave: a 422 message naming `Content-Type: application/json` when the body is not sent as JSON; host ports `DB_PORT` and `LB_PORT`, with the balancer bound to `127.0.0.1`; nginx `client_max_body_size 8m` and `Host` forwarding; a CI job `stand` that runs the stand on Docker Engine.
+- `make test`, `make lint` and `make load` run on the host through `uv run` (the author's decision). Task 1 originally ran them in a one-off `app` container. The recorded load runs used the in-container command.
+- Function and method signatures in `app/`, `scripts/` and `migrations/` are fully typed under mypy strict, and ruff requires docstrings on them. The largest test helpers and tests have them as well.
+- At the author's request, each replica checks at startup that `alembic_version` equals the migration head and exits otherwise (`app/schema_revision.py`, commit 90940af).
+- The README was drafted in the controller session at the author's request.
+- The independent review (Task 9, Step 1) ran on 2026-11-24 in a new Fable 5.2 session on a clean clone at 8c1107e. Its acceptance run passed, and it found no interleaving that breaks an invariant. The author settled its nine findings, and the controller applied them:
+  - the batch limit is checked before the items are validated (commit 7c84a37);
+  - a test covers the 503 from `/healthz` (b3860a3);
+  - the docs were corrected where the review disproved them: the M2 results, the two-firm case, and which probe results the tests re-confirm;
+  - the unbounded wait for a thread is documented with remedies;
+  - `/healthz`, `/docs`, `/redoc`, `/openapi.json`, the 307 redirect, the surrogate rule and the log's `status` field are added to the spec.
+
+  The README lists each finding and its outcome. The test count is now 162.
 
 ## Review Focus
 
@@ -79,7 +102,8 @@ Tasks 1–8 run in one controller session under superpowers:subagent-driven-deve
 | 3–6 | Step 3, core | Opus 5.5 |
 | 7–8 | Step 4, concurrency and load | Opus 5.5 |
 | — | Whole-branch review after Task 8 | Fable 5.2 |
-| 9 | Steps 5–6, independent review and README | Fable 5.2 in a new session; the author |
+| — | Fix wave after the whole-branch review; scoped re-review | Opus 5.5; Sonnet 5.5 |
+| 9 | Steps 5–6, independent review and README | Fable 5.2 in a new session (review); README drafted by the controller (Opus 5.5) at the author's request, reviewed by the author |
 
 ---
 
@@ -118,14 +142,14 @@ def test_healthz_reports_ok(client):
   - `GET /healthz` runs `SELECT 1`; returns `{"status": "ok"}`, or 503 `{"status": "unavailable"}` if the query fails.
   - Lifespan sets the AnyIO default thread limiter's `total_tokens` to `settings.db_pool_size` (spec section 10). This works only from the event loop; calling the limiter from a worker thread raises.
   - Compose services (spec section 5.6):
-    - `db`: `postgres:18`, mounts `scripts/init-test-db.sql` into `/docker-entrypoint-initdb.d/`, healthcheck with `pg_isready`, publishes `127.0.0.1:5432:5432` so that `uv run pytest` on the host reaches it.
+    - `db`: `postgres:18`, mounts `scripts/init-test-db.sql` into `/docker-entrypoint-initdb.d/`, healthcheck with `pg_isready`, publishes `127.0.0.1:${DB_PORT:-5432}:5432` so that `uv run pytest` on the host reaches it.
     - `app`: `deploy.replicas: 3`; command `uvicorn app.main:app --host 0.0.0.0 --port 8000` (one process per replica); no `ports`; waits for `db` healthy; healthcheck `python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"`.
-    - `lb`: `nginx:stable`, mounts `deploy/nginx.conf`, publishes `8000:80`, waits for `app` healthy.
+    - `lb`: `nginx:stable`, mounts `deploy/nginx.conf`, publishes `127.0.0.1:${LB_PORT:-8000}:80`, waits for `app` healthy.
     - The `migrate` service arrives in Task 2.
-  - `deploy/nginx.conf`: an `upstream` whose single entry is `server app:8000;` (the name resolves to all replicas). In `location /`: `proxy_pass` to that upstream, `proxy_connect_timeout 2s`, `proxy_set_header X-Request-Id $request_id`, `add_header X-Upstream $upstream_addr always`. Leave `proxy_next_upstream` at its default: it does not re-send a `POST` that was already sent to a replica.
+  - `deploy/nginx.conf`: an `upstream` whose single entry is `server app:8000;` (the name resolves to all replicas). `client_max_body_size 8m`. In `location /`: `proxy_pass` to that upstream, `proxy_connect_timeout 2s`, `proxy_set_header Host $http_host`, `proxy_set_header X-Request-Id $request_id`, `add_header X-Upstream $upstream_addr always`. Leave `proxy_next_upstream` at its default: it does not re-send a `POST` that was already sent to a replica.
   - The image is based on `python:3.14-slim` and installs with `uv sync --frozen`, dev dependencies included, so tests run in it.
-  - `make test` runs `docker compose run --rm -e TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@db:5432/firm_payments_test app pytest`; `make lint` runs `ruff check .`, `ruff format --check .`, `mypy app`; `make check` runs both.
-  - CI workflow: check out, `docker compose up -d db`, `make check`.
+  - `make test` starts the `db` service (`docker compose up -d --wait db`) and runs `uv run --locked pytest` on the host; `make lint` runs `ruff check .`, `ruff format --check .` and mypy through `uv run --locked`; `make check` runs both. `make up` runs `docker compose up --build -d --wait` and then restarts `lb`.
+  - CI workflow: job `check` (check out, install uv, `make check`) and job `stand` (`make up`, `make seed`, the sample request through the balancer, three distinct `X-Upstream` values, the Pinecrest balance).
 
 - [ ] **Step 4: Run the test.** Expected: PASS.
 
@@ -526,9 +550,9 @@ In-process tests call the service from threads, each with its own session. HTTP-
 
 - [ ] **Step 3: Implement `scripts/load.py`.** It inserts its own firms (ids from 1000, 1 100 firms, 1 000 000 000 cents each) through `--database-url`, removing leftovers from earlier runs first. It sends batches of three payments, each between `"0.01"` and `"10.00"`, with `httpx` from a `ThreadPoolExecutor`. `uniform` picks payer and payees at random; `hot-payer` uses one payer; `hot-payee` puts one payee in every batch; `max-batch` sends requests of 1 000 payments of `"0.01"` from one payer to 1 000 distinct payees and also reports the median and maximum request duration next to the 250 ms budget of spec section 5.7. Output: requests per second, p50, p95, p99 in milliseconds, and a count per status code. After the run it checks that no balance is negative, that the sum of the firms' balances is unchanged, and that there were no 500 responses; it exits non-zero otherwise.
 
-- [ ] **Step 4: Run the scenarios through the balancer.** `make load` runs the script inside the Compose network with `--base-url http://lb`. Run `uniform`, `hot-payer` and `hot-payee` with `--requests 2000 --concurrency 32`, and `max-batch` with `--requests 40 --concurrency 4`. Expected: exit code 0 for each.
+- [ ] **Step 4: Run the scenarios through the balancer.** `make load` runs the script on the host through the balancer's published port (the recorded runs used a one-off container inside the Compose network with `--base-url http://lb`). Run `uniform`, `hot-payer` and `hot-payee` with `--requests 2000 --concurrency 32`, and `max-batch` with `--requests 40 --concurrency 4`. Expected: exit code 0 for each.
 
-- [ ] **Step 5: Stand check S3.** On a freshly seeded database stop one replica with `docker stop $(docker compose ps -q app | head -1)`. Post `sample-request.json` five times with the header `Idempotency-Key: s3`. Expected: five 201 responses, four of them with `Idempotent-Replayed: true`; Pinecrest balance 3674875. Then `docker compose up -d --wait` and `docker compose restart lb` to restore three replicas behind the balancer.
+- [ ] **Step 5: Stand check S3.** On a freshly seeded database stop one replica with `docker stop $(docker compose ps -q app | head -1)`. Post `sample-request.json` five times with the header `Idempotency-Key: s3`. Expected: five 201 responses, four of them with `Idempotent-Replayed: true`; Pinecrest balance 3674875. Then `make up` to restore three replicas behind the balancer.
 
 - [ ] **Step 6: Record the numbers** in `docs/verification-notes.md`: section "Load run" with the machine description and the command lines, including the `max-batch` duration against the 250 ms budget; section "Stand checks" with the outcome of S1–S3. The load figures have no pass/fail thresholds: they replace the estimates in spec assumption 7 and section 5.7 with measurements. If `max-batch` exceeds the budget, record it and report it; do not change the limit silently.
 
@@ -538,21 +562,21 @@ In-process tests call the service from threads, each with its own session. HTTP-
 
 ### Task 9: Acceptance run and submission
 
-Owner: the author, with an independent review in a new session (agent workflow steps 5 and 6).
+Owner: the author, with an independent review in a new session (agent workflow step 5). The README draft was written in the controller session at the author's request (agent workflow step 6).
 
 **Files:**
 - Create: `README.md`
-- Modify: `ai-logs/` (exported session logs, unedited)
+- Modify: `ai-logs/` (raw session transcripts with masking only, and an English translation of each session's dialogue)
 
 - [ ] **Step 1: Independent review.** Run the step 5 prompt from the agent work plan in a new session that has only the repository. Triage every finding: fix, or record in the README why not.
 
-- [ ] **Step 2: Write the README** as a pull request description: solution and approach, issues encountered, assumptions (spec section 4), possible improvements (spec section 15), how to run and verify, AI tools used and where each fit, answers to the two questions. Take measured facts from `docs/verification-notes.md`. The run section names the prerequisites (Docker with Compose; `make` optional), gives the plain `docker compose` command behind every `make` target, states the endpoint as `POST http://localhost:8000/bulk-payments`, shows both sample requests (`sample-request.json`, `format-example-request.json`) with their expected balances, and says where the stand was verified (Podman locally, Docker Engine in CI). The AI section lists every session in `ai-logs/` with its tool and model, and states that the account email and home directory path were masked and nothing else was changed, and that aborted early attempts are not included (spec section 14.3).
+- [ ] **Step 2: Write the README** as a pull request description: solution and approach, issues encountered, assumptions (spec section 4), possible improvements (spec section 15), how to run and verify, AI tools used and where each fit, answers to the two questions. Take measured facts from `docs/verification-notes.md`. The run section names the prerequisites (Docker with Compose; uv for the tests and the load script; `make` optional), gives the plain command behind every `make` target, states the endpoint as `POST http://localhost:8000/bulk-payments`, shows both sample requests (`sample-request.json`, `format-example-request.json`) with their expected balances, and says where the stand was verified (Podman locally, Docker Engine in CI). The AI section lists every session in `ai-logs/` with its tool and model, and states that the account email and home directory path were masked and nothing else was changed, and that aborted early attempts are not included (spec section 14.3).
 
 - [ ] **Step 3: Acceptance run on a clean clone**, following only the README (spec section 14.2):
 
 ```bash
 git clone <repo> fp-acceptance && cd fp-acceptance
-docker compose up --build -d --wait
+make up
 make seed
 curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8000/bulk-payments \
   -H "Content-Type: application/json" -d @sample-request.json
@@ -562,7 +586,7 @@ Expected: `201`; balances 3674875, 170075, 1405050. Repeat the `curl` three more
 
 `sample-request.json` and `format-example-request.json` were committed in Task 2.
 
-- [ ] **Step 4: Submission checklist** (spec section 14.3): commit history shows the progress; `ai-logs/` is complete and unedited; README sections are all present; assumptions and improvements match the spec.
+- [ ] **Step 4: Submission checklist** (spec section 14.3): commit history shows the progress; `ai-logs/raw/` holds every working session, with only the account email and the local user name masked, and `ai-logs/` has an English dialogue of each; README sections are all present; assumptions and improvements match the spec.
 
 - [ ] **Step 5: Commit.** `git commit -m "docs: README, sample request and AI session logs"`
 

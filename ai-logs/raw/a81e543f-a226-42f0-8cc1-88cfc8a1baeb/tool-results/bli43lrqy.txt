@@ -1,0 +1,975 @@
+=== Makefile
+     1	# Python tooling runs on the host through uv; the stand and its database run in Compose.
+     2	# DB_PORT and LB_PORT match the host ports docker-compose.yml publishes.
+     3	DB_PORT ?= 5432
+     4	LB_PORT ?= 8000
+     5	LOAD_DB_URL = postgresql+psycopg://postgres:postgres@localhost:$(DB_PORT)/firm_payments
+     6	# make load ARGS="--scenario hot-payer --requests 2000 --concurrency 32"
+     7	ARGS ?= --scenario uniform --requests 2000 --concurrency 32
+     8	
+     9	.PHONY: up seed reset test lint check load
+    10	
+    11	# nginx resolves the replicas only at start, and recreated replicas get new
+    12	# addresses, so the balancer is restarted after every up.
+    13	up:
+    14		docker compose up --build -d --wait
+    15		docker compose restart lb
+    16	
+    17	seed:
+    18		docker compose exec -T db psql -U postgres -d firm_payments < scripts/seed.sql
+    19	
+    20	reset:
+    21		docker compose exec -T db psql -U postgres -d firm_payments -v ON_ERROR_STOP=1 \
+    22			-c "TRUNCATE payments, idempotency_keys, firms RESTART IDENTITY CASCADE" -f - < scripts/seed.sql
+    23	
+    24	# The tests use the firm_payments_test database on localhost:$(DB_PORT) (tests/conftest.py).
+    25	test:
+    26		docker compose up -d --wait db
+    27		uv run --locked pytest
+    28	
+    29	lint:
+    30		uv run --locked ruff check .
+    31		uv run --locked ruff format --check .
+    32		uv run --locked mypy app scripts migrations
+    33	
+    34	check: test lint
+    35	
+    36	# Through the balancer's host port. The script adds firms with ids from 1000 and
+    37	# payments between them; `make reset` returns to the seed.
+    38	load:
+    39		uv run --locked python scripts/load.py \
+    40			--base-url http://localhost:$(LB_PORT) --database-url $(LOAD_DB_URL) $(ARGS)
+=== docker-compose.yml
+     1	services:
+     2	  db:
+     3	    image: postgres:18
+     4	    environment:
+     5	      POSTGRES_PASSWORD: postgres
+     6	      POSTGRES_DB: firm_payments
+     7	    # Host ports are set by DB_PORT and LB_PORT; host-side tests follow DB_PORT.
+     8	    ports:
+     9	      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    10	    volumes:
+    11	      - ./scripts/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+    12	    healthcheck:
+    13	      test: ["CMD-SHELL", "pg_isready -U postgres -d firm_payments"]
+    14	      interval: 2s
+    15	      timeout: 3s
+    16	      retries: 30
+    17	
+    18	  migrate:
+    19	    build: .
+    20	    image: firm-payments
+    21	    command: alembic upgrade head
+    22	    environment:
+    23	      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/firm_payments
+    24	    restart: "no"
+    25	    depends_on:
+    26	      db:
+    27	        condition: service_healthy
+    28	
+    29	  app:
+    30	    build: .
+    31	    image: firm-payments
+    32	    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    33	    environment:
+    34	      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/firm_payments
+    35	    deploy:
+    36	      replicas: 3
+    37	    depends_on:
+    38	      migrate:
+    39	        condition: service_completed_successfully
+    40	    healthcheck:
+    41	      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+    42	      interval: 2s
+    43	      timeout: 3s
+    44	      retries: 30
+    45	
+    46	  lb:
+    47	    image: nginx:stable
+    48	    ports:
+    49	      - "127.0.0.1:${LB_PORT:-8000}:80"
+    50	    volumes:
+    51	      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    52	    depends_on:
+    53	      app:
+    54	        condition: service_healthy
+=== Dockerfile
+     1	FROM python:3.14-slim
+     2	
+     3	COPY --from=ghcr.io/astral-sh/uv:0.13.9 /uv /usr/local/bin/uv
+     4	
+     5	ENV UV_COMPILE_BYTECODE=1 \
+     6	    UV_LINK_MODE=copy \
+     7	    UV_PYTHON_DOWNLOADS=never \
+     8	    PATH="/app/.venv/bin:$PATH"
+     9	
+    10	WORKDIR /app
+    11	
+    12	COPY pyproject.toml uv.lock .python-version ./
+    13	RUN uv sync --frozen --no-install-project
+    14	
+    15	COPY . .
+    16	
+    17	CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+=== deploy/nginx.conf
+     1	upstream app {
+     2	    # The name resolves to every replica of the app service.
+     3	    server app:8000;
+     4	}
+     5	
+     6	server {
+     7	    listen 80;
+     8	
+     9	    # 1,000 payments with 500-character non-ASCII descriptions exceed nginx's 1 MB default.
+    10	    client_max_body_size 8m;
+    11	
+    12	    location / {
+    13	        proxy_pass http://app;
+    14	        proxy_connect_timeout 2s;
+    15	        # Keeps the client's host and port in redirects the app builds.
+    16	        proxy_set_header Host $http_host;
+    17	        proxy_set_header X-Request-Id $request_id;
+    18	        add_header X-Upstream $upstream_addr always;
+    19	    }
+    20	}
+=== .github/workflows/ci.yml
+     1	name: ci
+     2	
+     3	on:
+     4	  push:
+     5	  pull_request:
+     6	
+     7	jobs:
+     8	  check:
+     9	    runs-on: ubuntu-latest
+    10	    steps:
+    11	      - uses: actions/checkout@v4
+    12	      - uses: astral-sh/setup-uv@v10.4.0
+    13	        with:
+    14	          version: "0.13.9"
+    15	      - run: make check
+    16	
+    17	  # The run stand on Docker Engine (spec 13.8): three replicas behind the balancer.
+    18	  stand:
+    19	    runs-on: ubuntu-latest
+    20	    defaults:
+    21	      run:
+    22	        shell: bash
+    23	    env:
+    24	      BASE_URL: http://localhost:8000
+    25	    steps:
+    26	      - uses: actions/checkout@v4
+    27	      - run: docker compose version
+    28	      - run: make up
+    29	      - name: Wait for the balancer
+    30	        run: curl -fsS --retry 10 --retry-connrefused --retry-delay 1 "$BASE_URL/healthz"
+    31	      - run: make seed
+    32	      - name: The sample request returns 201
+    33	        run: |
+    34	          status=$(curl -sS -o response.json -w '%{http_code}' -X POST \
+    35	            -H 'Content-Type: application/json' --data-binary @sample-request.json \
+    36	            "$BASE_URL/bulk-payments")
+    37	          cat response.json
+    38	          echo
+    39	          test "$status" = 201
+    40	      - name: 30 health checks reach three replicas (S2)
+    41	        run: |
+    42	          upstreams=$(for _ in $(seq 30); do
+    43	            curl -sS -o /dev/null -D - "$BASE_URL/healthz" | tr -d '\r' | grep -i '^x-upstream:'
+    44	          done | sort | uniq -c)
+    45	          echo "$upstreams"
+    46	          test "$(echo "$upstreams" | wc -l)" -eq 3
+    47	      - name: Pinecrest balance is 3674875
+    48	        run: |
+    49	          balance=$(docker compose exec -T db psql -U postgres -d firm_payments -tAc \
+    50	            "SELECT balance_cents FROM firms WHERE uuid = '3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41'")
+    51	          echo "balance_cents=$balance"
+    52	          test "$balance" = 3674875
+    53	      - name: Stand state
+    54	        if: failure()
+    55	        run: |
+    56	          docker compose ps -a
+    57	          docker compose logs --no-color
+=== pyproject.toml
+     1	[project]
+     2	name = "firm-payments"
+     3	version = "0.1.0"
+     4	description = "Bulk payment service"
+     5	requires-python = ">=3.14,<3.15"
+     6	dependencies = [
+     7	    "alembic>=1.20.1",
+     8	    "fastapi>=0.165.0",
+     9	    "psycopg[binary]>=3.3.9",
+    10	    "pydantic-settings>=2.16.3",
+    11	    "sqlalchemy>=2.1.9",
+    12	    "uvicorn[standard]>=0.54.0",
+    13	]
+    14	
+    15	[tool.pytest.ini_options]
+    16	testpaths = ["tests"]
+    17	
+    18	[tool.ruff]
+    19	line-length = 100
+    20	extend-exclude = ["docs", "*.md"]
+    21	
+    22	[tool.ruff.lint]
+    23	select = ["E", "F", "I", "UP", "B", "D"]
+    24	# Docstrings are required on classes, functions and methods, not on modules or packages.
+    25	ignore = ["D100", "D104"]
+    26	
+    27	[tool.ruff.lint.pydocstyle]
+    28	convention = "pep257"
+    29	
+    30	[tool.ruff.lint.per-file-ignores]
+    31	"tests/**" = ["D"]
+    32	
+    33	[tool.mypy]
+    34	strict = true
+    35	plugins = ["pydantic.mypy"]
+    36	
+    37	[dependency-groups]
+    38	dev = [
+    39	    "httpx2>=2.16.2",
+    40	    "mypy>=2.4.1",
+    41	    "pytest>=9.2.0",
+    42	    "ruff>=0.17.6",
+    43	]
+=== alembic.ini
+     1	[alembic]
+     2	script_location = migrations
+     3	prepend_sys_path = .
+     4	path_separator = os
+     5	
+     6	[loggers]
+     7	keys = root
+     8	
+     9	[handlers]
+    10	keys = console
+    11	
+    12	[formatters]
+    13	keys = generic
+    14	
+    15	[logger_root]
+    16	level = WARNING
+    17	handlers = console
+    18	
+    19	[handler_console]
+    20	class = StreamHandler
+    21	args = (sys.stderr,)
+    22	formatter = generic
+    23	
+    24	[formatter_generic]
+    25	format = %(levelname)-5.5s [%(name)s] %(message)s
+=== sample-request.json
+     1	{
+     2	  "payer_firm_uuid": "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41",
+     3	  "payments": [
+     4	    {
+     5	      "amount": "6250",
+     6	      "payee_firm_uuid": "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25",
+     7	      "description": "Overflow returns, August 2026"
+     8	    },
+     9	    {
+    10	      "amount": "5800.5",
+    11	      "payee_firm_uuid": "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25",
+    12	      "description": "Amended returns, August 2026"
+    13	    },
+    14	    {
+    15	      "amount": "1200.75",
+    16	      "payee_firm_uuid": "8b2e4c71-0d3a-4f6e-b1c9-5a7d2e9f4c10",
+    17	      "description": "Bookkeeping cleanup, 3 clients"
+    18	    }
+    19	  ]
+    20	}
+=== format-example-request.json
+     1	{
+     2	  "payer_firm_uuid": "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41",
+     3	  "payments": [
+     4	    {
+     5	      "amount": "1200.75",
+     6	      "payee_firm_uuid": "8b2e4c71-0d3a-4f6e-b1c9-5a7d2e9f4c10",
+     7	      "description": "Bookkeeping cleanup, 3 clients"
+     8	    },
+     9	    {
+    10	      "amount": "300",
+    11	      "payee_firm_uuid": "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25",
+    12	      "description": "Referral fee, 2 clients"
+    13	    }
+    14	  ]
+    15	}
+=== .dockerignore
+     1	.git
+     2	.venv
+     3	.superpowers
+     4	__pycache__
+     5	.*_cache
+     6	docs
+     7	ai-logs
+=== .gitignore
+     1	# OS
+     2	.DS_Store
+     3	
+     4	# Task statement: copyrighted, kept locally only
+     5	docs/TA Firm Payments.pdf
+     6	docs/assignment.md
+     7	
+     8	# Python
+     9	__pycache__/
+    10	*.py[cod]
+    11	.venv/
+    12	.pytest_cache/
+    13	.mypy_cache/
+    14	.ruff_cache/
+    15	
+    16	# Agent tooling scratch
+    17	.superpowers/
+=== tests/conftest.py
+     1	import json
+     2	import os
+     3	import uuid
+     4	from collections.abc import Iterator
+     5	from pathlib import Path
+     6	from typing import Any
+     7	
+     8	# On the host the default follows DB_PORT, the port docker-compose.yml publishes `db` on.
+     9	os.environ["DATABASE_URL"] = os.environ.get(
+    10	    "TEST_DATABASE_URL",
+    11	    "postgresql+psycopg://postgres:postgres@localhost:"
+    12	    f"{os.environ.get('DB_PORT') or '5432'}/firm_payments_test",
+    13	)
+    14	
+    15	import pytest  # noqa: E402
+    16	from alembic import command  # noqa: E402
+    17	from alembic.config import Config  # noqa: E402
+    18	from fastapi.testclient import TestClient  # noqa: E402
+    19	from sqlalchemy import text  # noqa: E402
+    20	from sqlalchemy.orm import Session  # noqa: E402
+    21	
+    22	from app.db import get_engine  # noqa: E402
+    23	from app.main import app  # noqa: E402
+    24	
+    25	ROOT = Path(__file__).resolve().parent.parent
+    26	UNIT_DIR = Path(__file__).resolve().parent / "unit"
+    27	
+    28	PINECREST = "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41"
+    29	LOPEZ = "8b2e4c71-0d3a-4f6e-b1c9-5a7d2e9f4c10"
+    30	NAIR = "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25"
+    31	
+    32	SAMPLE_REQUEST = json.loads((ROOT / "sample-request.json").read_text())
+    33	FORMAT_EXAMPLE_REQUEST = json.loads((ROOT / "format-example-request.json").read_text())
+    34	
+    35	SEED_SQL = (ROOT / "scripts" / "seed.sql").read_text()
+    36	
+    37	
+    38	def alembic_config() -> Config:
+    39	    """Alembic configuration of the repository; the database comes from DATABASE_URL."""
+    40	    return Config(str(ROOT / "alembic.ini"))
+    41	
+    42	
+    43	def _is_unit_test(request: pytest.FixtureRequest) -> bool:
+    44	    """Tell whether the requesting test lives under tests/unit, which needs no database."""
+    45	    return UNIT_DIR in Path(str(request.path)).parents
+    46	
+    47	
+    48	@pytest.fixture(scope="session")
+    49	def _schema() -> None:
+    50	    """Migrate the test database to head, once per session."""
+    51	    command.upgrade(alembic_config(), "head")
+    52	
+    53	
+    54	@pytest.fixture(autouse=True)
+    55	def _fresh_data(request: pytest.FixtureRequest) -> None:
+    56	    """Migrate once per session, then reset and seed the data before every non-unit test."""
+    57	    if _is_unit_test(request):
+    58	        return
+    59	    request.getfixturevalue("_schema")
+    60	    with get_engine().begin() as conn:
+    61	        conn.exec_driver_sql("TRUNCATE payments, idempotency_keys, firms RESTART IDENTITY CASCADE")
+    62	        conn.exec_driver_sql(SEED_SQL)
+    63	
+    64	
+    65	@pytest.fixture
+    66	def client() -> Iterator[TestClient]:
+    67	    """A client of the app with its lifespan running; server errors come back as 500s."""
+    68	    with TestClient(app, raise_server_exceptions=False) as c:
+    69	        yield c
+    70	
+    71	
+    72	@pytest.fixture
+    73	def db() -> Iterator[Session]:
+    74	    """A session on the app's engine to arrange and check data; it commits only when told to."""
+    75	    with Session(get_engine(), expire_on_commit=False) as session:
+    76	        yield session
+    77	
+    78	
+    79	def balances(db: Session) -> dict[str, int]:
+    80	    """Every firm's balance in cents, by uuid."""
+    81	    rows = db.execute(text("SELECT uuid, balance_cents FROM firms")).all()
+    82	    return {u: cents for u, cents in rows}
+    83	
+    84	
+    85	def payment_rows(db: Session) -> list[tuple[int, int, int, str]]:
+    86	    """Every payment as (payer id, payee id, amount in cents, description), in id order."""
+    87	    rows = db.execute(
+    88	        text(
+    89	            "SELECT payer_firm_id, payee_firm_id, amount_cents, description"
+    90	            " FROM payments ORDER BY id"
+    91	        )
+    92	    ).all()
+    93	    return [(a, b, c, d) for a, b, c, d in rows]
+    94	
+    95	
+    96	def add_firm(db: Session, firm_id: int, balance_cents: int) -> str:
+    97	    """Insert and commit a firm with a fresh uuid, and return the uuid."""
+    98	    firm_uuid = str(uuid.uuid4())
+    99	    db.execute(
+   100	        text("INSERT INTO firms (id, name, balance_cents, uuid) VALUES (:i, :n, :b, :u)"),
+   101	        {"i": firm_id, "n": f"Firm {firm_id}", "b": balance_cents, "u": firm_uuid},
+   102	    )
+   103	    db.commit()
+   104	    return firm_uuid
+   105	
+   106	
+   107	def set_balance(db: Session, uuid: str, balance_cents: int) -> None:
+   108	    """Set a firm's balance and commit."""
+   109	    db.execute(
+   110	        text("UPDATE firms SET balance_cents = :b WHERE uuid = :u"),
+   111	        {"b": balance_cents, "u": uuid},
+   112	    )
+   113	    db.commit()
+   114	
+   115	
+   116	# Any: a JSON request body that tests also edit into invalid shapes before sending it.
+   117	def bulk(payer: str, *payments: tuple[str, str]) -> dict[str, Any]:
+   118	    """Build a request body from (payee uuid, amount) pairs; descriptions are p1, p2, ..."""
+   119	    return {
+   120	        "payer_firm_uuid": payer,
+   121	        "payments": [
+   122	            {"amount": amount, "payee_firm_uuid": payee, "description": f"p{i}"}
+   123	            for i, (payee, amount) in enumerate(payments, start=1)
+   124	        ],
+   125	    }
+=== tests/unit/__init__.py
+=== tests/unit/conftest.py
+     1	import pytest
+     2	
+     3	from app.config import Settings
+     4	
+     5	
+     6	@pytest.fixture
+     7	def settings() -> Settings:
+     8	    """Settings for code that never opens a connection; override fields with model_copy."""
+     9	    return Settings(database_url="postgresql+psycopg://unused")
+=== tests/unit/test_amount.py
+     1	import pytest
+     2	
+     3	from app.schemas import format_cents, parse_amount_cents
+     4	
+     5	
+     6	@pytest.mark.parametrize(
+     7	    "text_, cents",
+     8	    [
+     9	        ("1200.75", 120_075),
+    10	        ("300", 30_000),
+    11	        ("5800.5", 580_050),
+    12	        ("0.01", 1),
+    13	        ("007", 700),
+    14	        ("21474836.47", 2_147_483_647),
+    15	    ],
+    16	)
+    17	def test_valid_amounts(text_, cents):
+    18	    assert parse_amount_cents(text_) == cents
+    19	
+    20	
+    21	@pytest.mark.parametrize(
+    22	    "text_",
+    23	    [
+    24	        "0",
+    25	        "0.00",
+    26	        "-1",
+    27	        "+1",
+    28	        "1.234",
+    29	        "1.",
+    30	        ".5",
+    31	        "1e3",
+    32	        " 1",
+    33	        "1 ",
+    34	        "1\n",
+    35	        "1,5",
+    36	        "",
+    37	        "NaN",
+    38	        "١٢",
+    39	        "21474836.48",
+    40	        "000000000001",  # 12 characters, although the value (100 cents) is in range
+    41	        "9" * 5000,
+    42	    ],
+    43	)
+    44	def test_invalid_amounts(text_: str) -> None:
+    45	    """Only ASCII digits, an optional point and 1 or 2 decimals, in range and 11 long at most."""
+    46	    with pytest.raises(ValueError):
+    47	        parse_amount_cents(text_)
+    48	
+    49	
+    50	@pytest.mark.parametrize(
+    51	    "cents, text_",
+    52	    [(625_000, "6250.00"), (580_050, "5800.50"), (1, "0.01"), (1_325_125, "13251.25")],
+    53	)
+    54	def test_format_cents(cents, text_):
+    55	    assert format_cents(cents) == text_
+=== tests/unit/test_build_command.py
+     1	import re
+     2	
+     3	import pytest
+     4	
+     5	from app.errors import SelfPayment, ValidationFailed
+     6	from app.schemas import BulkPaymentRequest
+     7	from app.service import build_command
+     8	from tests.conftest import LOPEZ, NAIR, PINECREST, SAMPLE_REQUEST, bulk
+     9	
+    10	
+    11	def _request(payload):
+    12	    return BulkPaymentRequest.model_validate(payload)
+    13	
+    14	
+    15	def _error_locs(excinfo):
+    16	    return [detail["loc"] for detail in excinfo.value.details]
+    17	
+    18	
+    19	def test_sample_request_totals(settings):
+    20	    cmd = build_command(BulkPaymentRequest.model_validate(SAMPLE_REQUEST), None, settings)
+    21	    assert cmd.total_cents == 1_325_125
+    22	    assert cmd.credits == {NAIR: 1_205_050, LOPEZ: 120_075}
+    23	    assert cmd.firm_uuids == {PINECREST, NAIR, LOPEZ}
+    24	    assert [i.amount_cents for i in cmd.items] == [625_000, 580_050, 120_075]
+    25	    assert cmd.idempotency_key is None and cmd.request_hash is None
+    26	
+    27	
+    28	def test_uuids_are_lowercased(settings):
+    29	    payload = bulk(PINECREST.upper(), (NAIR.upper(), "1"), ("{" + LOPEZ.upper() + "}", "2"))
+    30	    cmd = build_command(_request(payload), None, settings)
+    31	    assert cmd.payer_uuid == PINECREST
+    32	    assert [i.payee_uuid for i in cmd.items] == [NAIR, LOPEZ]
+    33	    assert cmd.firm_uuids == {PINECREST, NAIR, LOPEZ}
+    34	
+    35	
+    36	def test_self_payment_rejected(settings):
+    37	    payload = bulk(PINECREST, (NAIR, "1"), (PINECREST.upper(), "2"))
+    38	    with pytest.raises(SelfPayment):
+    39	        build_command(_request(payload), None, settings)
+    40	
+    41	
+    42	def test_too_many_payments(settings):
+    43	    settings = settings.model_copy(update={"max_payments_per_request": 2})
+    44	    build_command(_request(bulk(PINECREST, (NAIR, "1"), (LOPEZ, "2"))), None, settings)
+    45	    payload = bulk(PINECREST, (NAIR, "1"), (LOPEZ, "2"), (NAIR, "3"))
+    46	    with pytest.raises(ValidationFailed) as excinfo:
+    47	        build_command(_request(payload), None, settings)
+    48	    assert _error_locs(excinfo) == [["body", "payments"]]
+    49	
+    50	
+    51	def test_description_too_long(settings):
+    52	    payload = bulk(PINECREST, (NAIR, "1"), (LOPEZ, "2"))
+    53	    payload["payments"][0]["description"] = "x" * 500
+    54	    build_command(_request(payload), None, settings)
+    55	    payload["payments"][1]["description"] = "x" * 501
+    56	    with pytest.raises(ValidationFailed) as excinfo:
+    57	        build_command(_request(payload), None, settings)
+    58	    assert _error_locs(excinfo) == [["body", "payments", 1, "description"]]
+    59	
+    60	
+    61	def test_total_overflow(settings):
+    62	    build_command(_request(bulk(PINECREST, (NAIR, "21474836.46"), (LOPEZ, "0.01"))), None, settings)
+    63	    payload = bulk(PINECREST, (NAIR, "21474836.47"), (LOPEZ, "21474836.47"))
+    64	    with pytest.raises(ValidationFailed) as excinfo:
+    65	        build_command(_request(payload), None, settings)
+    66	    assert _error_locs(excinfo) == [["body", "payments"]]
+    67	
+    68	
+    69	@pytest.mark.parametrize("key", ["", "a" * 256, "has space", "ключ"])
+    70	def test_invalid_idempotency_key(settings, key):
+    71	    with pytest.raises(ValidationFailed) as excinfo:
+    72	        build_command(_request(SAMPLE_REQUEST), key, settings)
+    73	    assert _error_locs(excinfo) == [["header", "Idempotency-Key"]]
+    74	
+    75	
+    76	def test_valid_key_produces_hash(settings):
+    77	    request = BulkPaymentRequest.model_validate(SAMPLE_REQUEST)
+    78	    cmd = build_command(request, "a" * 255, settings)
+    79	    assert cmd.idempotency_key == "a" * 255
+    80	    assert re.fullmatch(r"[0-9a-f]{64}", cmd.request_hash)
+    81	
+    82	
+    83	def test_hash_ignores_uuid_and_amount_spelling(settings):
+    84	    plain = bulk(PINECREST, (NAIR, "300"))
+    85	    respelled = bulk(PINECREST.upper(), ("{" + NAIR.upper() + "}", "300.00"))
+    86	    first = build_command(_request(plain), "key-1", settings)
+    87	    second = build_command(_request(respelled), "key-1", settings)
+    88	    assert first.request_hash == second.request_hash
+=== tests/unit/test_get_engine.py
+     1	"""One engine per process: its pool is what bounds the process's database connections."""
+     2	
+     3	import threading
+     4	from collections.abc import Iterator
+     5	from concurrent.futures import ThreadPoolExecutor
+     6	
+     7	import pytest
+     8	from fastapi.testclient import TestClient
+     9	from sqlalchemy import Engine
+    10	
+    11	import app.db
+    12	import app.main
+    13	from app.db import get_engine
+    14	from app.main import app as application
+    15	
+    16	THREADS = 16
+    17	
+    18	
+    19	@pytest.fixture
+    20	def no_engine_yet(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Engine]]:
+    21	    """Start without an engine; restore the process's engine and dispose the new ones after.
+    22	
+    23	    Creating an engine opens no connection, so these tests need no database.
+    24	    """
+    25	    monkeypatch.setattr(app.db, "_engine", None)
+    26	    created: list[Engine] = []
+    27	    yield created
+    28	    for engine in created:
+    29	        engine.dispose()
+    30	
+    31	
+    32	def test_concurrent_first_calls_share_one_engine(no_engine_yet):
+    33	    barrier = threading.Barrier(THREADS)
+    34	
+    35	    def first_call(_: int) -> Engine:
+    36	        barrier.wait()
+    37	        return get_engine()
+    38	
+    39	    with ThreadPoolExecutor(max_workers=THREADS) as executor:
+    40	        engines = list(executor.map(first_call, range(THREADS)))
+    41	    no_engine_yet.extend({id(engine): engine for engine in engines}.values())
+    42	
+    43	    assert len(no_engine_yet) == 1, f"{len(no_engine_yet)} engines from {THREADS} first calls"
+    44	
+    45	
+    46	def test_startup_builds_the_engine(no_engine_yet, monkeypatch):
+    47	    # The schema check opens a connection; tests/db/test_schema_revision.py covers it.
+    48	    monkeypatch.setattr(app.main, "check_engine_schema", lambda engine: None)
+    49	    with TestClient(application):
+    50	        engine = app.db._engine
+    51	    assert engine is not None
+    52	    no_engine_yet.append(engine)
+    53	    assert get_engine() is engine
+=== tests/unit/test_request_hash.py
+     1	import hashlib
+     2	import re
+     3	
+     4	import pytest
+     5	
+     6	from app.idempotency import compute_request_hash
+     7	from app.schemas import parse_amount_cents
+     8	
+     9	PAYER = "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41"
+    10	PAYEE = "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25"
+    11	OTHER = "8b2e4c71-0d3a-4f6e-b1c9-5a7d2e9f4c10"
+    12	
+    13	BASE_ITEMS = [(PAYEE, 100, "a"), (OTHER, 200, "b")]
+    14	
+    15	
+    16	def test_hash_ignores_amount_spelling():
+    17	    short = compute_request_hash(PAYER, [(PAYEE, parse_amount_cents("300"), "x")])
+    18	    padded = compute_request_hash(PAYER, [(PAYEE, parse_amount_cents("300.00"), "x")])
+    19	    assert short == padded
+    20	
+    21	
+    22	@pytest.mark.parametrize(
+    23	    "payer, items",
+    24	    [
+    25	        (OTHER, BASE_ITEMS),
+    26	        (PAYER, [(OTHER, 100, "a"), (OTHER, 200, "b")]),
+    27	        (PAYER, [(PAYEE, 101, "a"), (OTHER, 200, "b")]),
+    28	        (PAYER, [(PAYEE, 100, "c"), (OTHER, 200, "b")]),
+    29	        (PAYER, list(reversed(BASE_ITEMS))),
+    30	    ],
+    31	    ids=["payer", "payee", "amount", "description", "order"],
+    32	)
+    33	def test_hash_is_sensitive(payer, items):
+    34	    assert compute_request_hash(payer, items) != compute_request_hash(PAYER, BASE_ITEMS)
+    35	
+    36	
+    37	def test_hash_is_sha256_hex():
+    38	    assert re.fullmatch(r"[0-9a-f]{64}", compute_request_hash(PAYER, [(PAYEE, 100, "x")]))
+    39	
+    40	
+    41	def test_hash_canonical_form_is_fixed():
+    42	    canonical = f'{{"payer":"{PAYER}","payments":[["{PAYEE}",100,"café"]]}}'
+    43	    expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    44	    assert compute_request_hash(PAYER, [(PAYEE, 100, "café")]) == expected
+=== tests/unit/test_schemas.py
+     1	import copy
+     2	import json
+     3	from typing import Any
+     4	
+     5	import pytest
+     6	from pydantic import ValidationError
+     7	
+     8	from app.schemas import BulkPaymentRequest
+     9	from tests.conftest import SAMPLE_REQUEST
+    10	
+    11	
+    12	def _request(**fields: Any) -> dict[str, Any]:
+    13	    payload = copy.deepcopy(SAMPLE_REQUEST)
+    14	    payload.update(fields)
+    15	    return payload
+    16	
+    17	
+    18	def _with_payment(**fields: Any) -> dict[str, Any]:
+    19	    payload = copy.deepcopy(SAMPLE_REQUEST)
+    20	    payload["payments"][0].update(fields)
+    21	    return payload
+    22	
+    23	
+    24	def _without_description() -> dict[str, Any]:
+    25	    payload = copy.deepcopy(SAMPLE_REQUEST)
+    26	    del payload["payments"][0]["description"]
+    27	    return payload
+    28	
+    29	
+    30	INVALID_REQUESTS = {
+    31	    "empty-payments": _request(payments=[]),
+    32	    "unknown-top-level-field": _request(currency="USD"),
+    33	    "unknown-payment-field": _with_payment(currency="USD"),
+    34	    # Decoded from JSON text, as the endpoint receives it; no float literal in the source.
+    35	    "amount-json-number": _with_payment(amount=json.loads("12.5")),
+    36	    "amount-null": _with_payment(amount=None),
+    37	    "amount-three-decimals": _with_payment(amount="1.234"),
+    38	    "description-number": _with_payment(description=5),
+    39	    "description-missing": _without_description(),
+    40	    "description-nul": _with_payment(description="a\u0000b"),
+    41	    "description-lone-surrogate": _with_payment(description="a\ud800b"),
+    42	    "payee-not-a-uuid": _with_payment(payee_firm_uuid="not-a-uuid"),
+    43	}
+    44	
+    45	
+    46	@pytest.mark.parametrize("payload", INVALID_REQUESTS.values(), ids=INVALID_REQUESTS.keys())
+    47	def test_invalid_request(payload):
+    48	    with pytest.raises(ValidationError):
+    49	        BulkPaymentRequest.model_validate(payload)
+    50	
+    51	
+    52	# The escape \ud800 written into the raw body, as a client would send it.
+    53	LONE_SURROGATE_BODY = json.dumps(SAMPLE_REQUEST).replace("Overflow returns", "Overflow \\ud800")
+    54	
+    55	
+    56	def test_lone_surrogate_decoded_by_json_loads_is_rejected():
+    57	    # FastAPI decodes the body with json.loads, which keeps the lone surrogate.
+    58	    payload = json.loads(LONE_SURROGATE_BODY)
+    59	    assert "\ud800" in payload["payments"][0]["description"]
+    60	    with pytest.raises(ValidationError):
+    61	        BulkPaymentRequest.model_validate(payload)
+    62	
+    63	
+    64	def test_lone_surrogate_in_raw_json_is_rejected():
+    65	    with pytest.raises(ValidationError):
+    66	        BulkPaymentRequest.model_validate_json(LONE_SURROGATE_BODY)
+    67	
+    68	
+    69	def test_sample_request_is_valid():
+    70	    request = BulkPaymentRequest.model_validate(SAMPLE_REQUEST)
+    71	    assert [p.amount for p in request.payments] == ["6250", "5800.5", "1200.75"]
+=== tests/db/__init__.py
+=== tests/db/test_engine.py
+     1	import logging
+     2	
+     3	import pytest
+     4	from sqlalchemy.exc import DBAPIError
+     5	from sqlalchemy.orm import Session
+     6	
+     7	from app.db import get_engine
+     8	from app.service import BulkPaymentCommand, PaymentItem, execute_bulk_payment
+     9	from tests.conftest import NAIR, PINECREST, balances, payment_rows
+    10	
+    11	
+    12	def test_database_errors_do_not_carry_descriptions(
+    13	    db: Session, caplog: pytest.LogCaptureFixture
+    14	) -> None:
+    15	    """An unexpected DBAPIError is logged with its text by the server; spec 12 keeps
+    16	    descriptions out of logs, so the error text must not carry statement parameters."""
+    17	    caplog.set_level(logging.DEBUG)
+    18	    before = balances(db)
+    19	    # Built by hand to bypass validation: U+0000 makes the payments INSERT fail.
+    20	    command = BulkPaymentCommand(
+    21	        payer_uuid=PINECREST,
+    22	        items=(
+    23	            PaymentItem(NAIR, 100, "first-secret-description"),
+    24	            PaymentItem(NAIR, 100, "second-secret-description\x00"),
+    25	        ),
+    26	        total_cents=200,
+    27	        credits={NAIR: 200},
+    28	        firm_uuids=frozenset({PINECREST, NAIR}),
+    29	        idempotency_key=None,
+    30	        request_hash=None,
+    31	    )
+    32	    with Session(get_engine()) as session, pytest.raises(DBAPIError) as excinfo:
+    33	        execute_bulk_payment(session, command, 5000)
+    34	    assert "INSERT INTO payments" in str(excinfo.value)
+    35	    for text in (str(excinfo.value), repr(excinfo.value), caplog.text):
+    36	        assert "secret-description" not in text
+    37	    assert balances(db) == before and payment_rows(db) == []
+=== tests/db/test_schema_revision.py
+     1	"""A replica refuses to start unless the database is at the migrations' head (spec 5.6)."""
+     2	
+     3	import logging
+     4	from pathlib import Path
+     5	
+     6	import pytest
+     7	from fastapi.testclient import TestClient
+     8	from sqlalchemy import text
+     9	
+    10	import app.schema_revision
+    11	from app.db import get_engine
+    12	from app.main import app as application
+    13	from app.schema_revision import (
+    14	    SchemaRevisionMismatch,
+    15	    check_schema_revision,
+    16	    migrations_heads,
+    17	)
+    18	
+    19	
+    20	def _error_records(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str]]:
+    21	    return [
+    22	        (record.levelno, record.getMessage())
+    23	        for record in caplog.records
+    24	        if record.name == "app.schema_revision"
+    25	    ]
+    26	
+    27	
+    28	def _refused_in_rolled_back_transaction(statement: str | None) -> SchemaRevisionMismatch:
+    29	    """Run statement and the check in one transaction, roll it back, return the error."""
+    30	    with get_engine().connect() as conn:
+    31	        try:
+    32	            if statement is not None:
+    33	                conn.execute(text(statement))
+    34	            with pytest.raises(SchemaRevisionMismatch) as excinfo:
+    35	                check_schema_revision(conn)
+    36	        finally:
+    37	            conn.rollback()
+    38	    return excinfo.value
+    39	
+    40	
+    41	def test_check_passes_at_head_from_any_directory(
+    42	    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    43	) -> None:
+    44	    """The heads come from the package's migrations, not from the working directory."""
+    45	    monkeypatch.chdir(tmp_path)
+    46	    assert migrations_heads() != []
+    47	    with get_engine().connect() as conn:
+    48	        check_schema_revision(conn)
+    49	
+    50	
+    51	@pytest.mark.parametrize(
+    52	    ("statement", "current"),
+    53	    [
+    54	        ("UPDATE alembic_version SET version_num = 'bogus'", "['bogus']"),
+    55	        ("DELETE FROM alembic_version", "[]"),
+    56	        ("DROP TABLE alembic_version", "[]"),
+    57	        ("INSERT INTO alembic_version (version_num) VALUES ('second')", "['0001', 'second']"),
+    58	    ],
+    59	    ids=["other_revision", "empty_table", "no_table", "extra_row"],
+    60	)
+    61	def test_check_rejects_a_schema_not_at_head(
+    62	    statement: str, current: str, caplog: pytest.LogCaptureFixture
+    63	) -> None:
+    64	    """The change is made and checked in one transaction that is rolled back."""
+    65	    message = str(_refused_in_rolled_back_transaction(statement))
+    66	
+    67	    expected = migrations_heads()
+    68	    assert f"alembic_version holds {current}, but" in message
+    69	    assert f"have the heads {expected}" in message
+    70	    assert "alembic upgrade head" in message
+    71	    assert _error_records(caplog) == [(logging.ERROR, message)]
+    72	    with get_engine().connect() as conn:
+    73	        check_schema_revision(conn)
+    74	
+    75	
+    76	@pytest.mark.parametrize(
+    77	    ("statement", "current"),
+    78	    [(None, "['0001']"), ("DELETE FROM alembic_version", "[]")],
+    79	    ids=["database_at_0001", "empty_table"],
+    80	)
+    81	def test_check_rejects_a_build_without_migrations(
+    82	    statement: str | None,
+    83	    current: str,
+    84	    monkeypatch: pytest.MonkeyPatch,
+    85	    tmp_path: Path,
+    86	    caplog: pytest.LogCaptureFixture,
+    87	) -> None:
+    88	    """No script heads never match, not even a database with no revision either."""
+    89	    (tmp_path / "versions").mkdir()
+    90	    monkeypatch.setattr(app.schema_revision, "MIGRATIONS_DIR", tmp_path)
+    91	    assert migrations_heads() == []
+    92	
+    93	    message = str(_refused_in_rolled_back_transaction(statement))
+    94	
+    95	    assert f"alembic_version holds {current}, but" in message
+    96	    assert f"the migrations in {tmp_path} have the heads []" in message
+    97	    assert _error_records(caplog) == [(logging.ERROR, message)]
+    98	
+    99	
+   100	def test_startup_fails_when_schema_is_not_at_head(
+   101	    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+   102	) -> None:
+   103	    """The lifespan runs the check on one pooled connection and returns it on failure."""
+   104	    monkeypatch.setattr(app.schema_revision, "migrations_heads", lambda: ["f00d"])
+   105	
+   106	    with pytest.raises(SchemaRevisionMismatch, match=r"have the heads \['f00d'\]"):
+   107	        with TestClient(application):
+   108	            pytest.fail("the application started")
+   109	
+   110	    assert [level for level, _ in _error_records(caplog)] == [logging.ERROR]
+   111	    assert get_engine().pool.checkedout() == 0
+=== tests/db/test_schema.py
+     1	import pytest
+     2	from alembic import command
+     3	from sqlalchemy import text
+     4	from sqlalchemy.exc import IntegrityError
+     5	
+     6	from tests.conftest import LOPEZ, NAIR, PINECREST, alembic_config, balances
+     7	
+     8	
+     9	def test_seed_matches_task(db):
+    10	    assert balances(db) == {PINECREST: 5_000_000, LOPEZ: 50_000, NAIR: 200_000}
+    11	
+    12	
+    13	def test_firm_uuid_is_unique(db):
+    14	    with pytest.raises(IntegrityError):
+    15	        db.execute(
+    16	            text("INSERT INTO firms (id, name, balance_cents, uuid) VALUES (9, 'x', 0, :u)"),
+    17	            {"u": PINECREST},
+    18	        )
+    19	
+    20	
+    21	def test_payment_requires_existing_firms(db):
+    22	    with pytest.raises(IntegrityError):
+    23	        db.execute(
+    24	            text(
+    25	                "INSERT INTO payments (payer_firm_id, payee_firm_id, amount_cents, description)"
+    26	                " VALUES (1, 999, 1, 'x')"
+    27	            )
+    28	        )
+    29	
+    30	
+    31	def test_idempotency_key_is_unique_per_payer(db):
+    32	    insert = text(
+    33	        "INSERT INTO idempotency_keys (payer_firm_uuid, key, request_hash) VALUES (:p, 'k', 'h')"
+    34	    )
+    35	    db.execute(insert, {"p": PINECREST})
+    36	    db.execute(insert, {"p": LOPEZ})  # same key, other payer: allowed
+    37	    with pytest.raises(IntegrityError):
+    38	        db.execute(insert, {"p": PINECREST})
+    39	
+    40	
+    41	def test_migration_round_trip():
+    42	    config = alembic_config()
+    43	    command.downgrade(config, "base")
+    44	    command.upgrade(config, "head")  # leave the schema at head for the tests that follow

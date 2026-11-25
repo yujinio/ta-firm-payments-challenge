@@ -1,0 +1,729 @@
+=== app/main.py
+     1	import json
+     2	import logging
+     3	import socket
+     4	import time
+     5	import uuid
+     6	from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+     7	from contextlib import asynccontextmanager
+     8	from typing import Any
+     9	
+    10	import anyio.to_thread
+    11	from fastapi import FastAPI, Request, Response
+    12	from fastapi.exceptions import RequestValidationError
+    13	from fastapi.responses import JSONResponse
+    14	from starlette.exceptions import HTTPException as StarletteHTTPException
+    15	
+    16	from app.api import BULK_PAYMENTS_PATH, router
+    17	from app.config import get_settings
+    18	from app.db import get_engine
+    19	from app.errors import DomainError, ServiceBusy, ValidationFailed
+    20	from app.schemas import format_cents
+    21	
+    22	INSTANCE = socket.gethostname()
+    23	
+    24	request_logger = logging.getLogger("app.requests")
+    25	
+    26	_HTTP_ERROR_CODES = {404: "not_found", 405: "method_not_allowed"}
+    27	
+    28	# Pydantic messages that quote part of the input ("found `z` at 0"), by error type.
+    29	_FIXED_MESSAGES = {"uuid_parsing": "Input should be a valid UUID"}
+    30	
+    31	
+    32	def _configure_logging() -> None:
+    33	    # Uvicorn configures only its own loggers; without a handler INFO records are dropped.
+    34	    app_logger = logging.getLogger("app")
+    35	    if not app_logger.handlers:
+    36	        handler = logging.StreamHandler()
+    37	        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    38	        app_logger.addHandler(handler)
+    39	        app_logger.setLevel(logging.INFO)
+    40	
+    41	
+    42	@asynccontextmanager
+    43	async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    44	    _configure_logging()
+    45	    # Synchronous endpoints wait for a thread instead of failing on pool checkout.
+    46	    # The limiter can be changed only from the event loop.
+    47	    anyio.to_thread.current_default_thread_limiter().total_tokens = get_settings().db_pool_size
+    48	    # Built before the first request, so requests never race to create it.
+    49	    get_engine()
+    50	    yield
+    51	
+    52	
+    53	async def log_request(
+    54	    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    55	) -> Response:
+    56	    """Write one record per bulk payment request; descriptions are never logged."""
+    57	    if request.url.path != BULK_PAYMENTS_PATH:
+    58	        return await call_next(request)
+    59	    started = time.perf_counter()
+    60	    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+    61	    status = 500
+    62	    try:
+    63	        response = await call_next(request)
+    64	        status = response.status_code
+    65	        return response
+    66	    finally:
+    67	        state = request.state
+    68	        total_cents = getattr(state, "total_cents", None)
+    69	        record = {
+    70	            "request_id": request_id,
+    71	            "instance": INSTANCE,
+    72	            "payer": getattr(state, "payer", None),
+    73	            "payments": getattr(state, "payment_count", None),
+    74	            "total": None if total_cents is None else format_cents(total_cents),
+    75	            # Unset only when an exception escaped to the 500 handler.
+    76	            "outcome": getattr(state, "outcome", "internal_error"),
+    77	            "status": status,
+    78	            "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+    79	        }
+    80	        request_logger.info(json.dumps(record))
+    81	
+    82	
+    83	def _error_response(
+    84	    request: Request,
+    85	    status_code: int,
+    86	    code: str,
+    87	    message: str,
+    88	    *,
+    89	    details: list[dict[str, Any]] | None = None,
+    90	    headers: Mapping[str, str] | None = None,
+    91	) -> JSONResponse:
+    92	    request.state.outcome = code
+    93	    error: dict[str, Any] = {"code": code, "message": message}
+    94	    if details is not None:
+    95	        error["details"] = details
+    96	    return JSONResponse({"error": error}, status_code=status_code, headers=headers)
+    97	
+    98	
+    99	async def handle_domain_error(request: Request, exc: DomainError) -> JSONResponse:
+   100	    details = exc.details if isinstance(exc, ValidationFailed) else None
+   101	    headers = {"Retry-After": "1"} if isinstance(exc, ServiceBusy) else None
+   102	    return _error_response(
+   103	        request, exc.status_code, exc.code, exc.message, details=details, headers=headers
+   104	    )
+   105	
+   106	
+   107	async def handle_request_validation_error(
+   108	    request: Request, exc: RequestValidationError
+   109	) -> JSONResponse:
+   110	    # Only loc, msg and type: input and ctx carry the rejected value, which may be
+   111	    # sensitive or impossible to encode (a lone surrogate from a \ud800 escape).
+   112	    details = [
+   113	        {
+   114	            "loc": list(error["loc"]),
+   115	            "msg": _FIXED_MESSAGES.get(error["type"], error["msg"]),
+   116	            "type": error["type"],
+   117	        }
+   118	        for error in exc.errors()
+   119	    ]
+   120	    return _error_response(
+   121	        request, 422, "validation_error", "the request is invalid", details=details
+   122	    )
+   123	
+   124	
+   125	async def handle_http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+   126	    if exc.status_code == 400:
+   127	        # FastAPI raises 400 only when it cannot read the body as JSON, for
+   128	        # example invalid UTF-8; spec section 8.1 makes that a validation error.
+   129	        message = "the request body is not valid JSON"
+   130	        detail = {"loc": ["body"], "msg": message, "type": "json_invalid"}
+   131	        return _error_response(request, 422, "validation_error", message, details=[detail])
+   132	    code = _HTTP_ERROR_CODES.get(exc.status_code, "http_error")
+   133	    return _error_response(request, exc.status_code, code, str(exc.detail), headers=exc.headers)
+   134	
+   135	
+   136	async def handle_internal_error(request: Request, exc: Exception) -> JSONResponse:
+   137	    # Uvicorn logs the traceback; the client learns nothing about the cause.
+   138	    return _error_response(request, 500, "internal_error", "internal server error")
+   139	
+   140	
+   141	def create_app() -> FastAPI:
+   142	    application = FastAPI(lifespan=lifespan)
+   143	    application.include_router(router)
+   144	    application.middleware("http")(log_request)
+   145	    application.exception_handler(DomainError)(handle_domain_error)
+   146	    application.exception_handler(RequestValidationError)(handle_request_validation_error)
+   147	    application.exception_handler(StarletteHTTPException)(handle_http_exception)
+   148	    application.exception_handler(Exception)(handle_internal_error)
+   149	    return application
+   150	
+   151	
+   152	app = create_app()
+=== app/api.py
+     1	from typing import Annotated
+     2	
+     3	from fastapi import APIRouter, Depends, Request, Response
+     4	from fastapi.responses import JSONResponse
+     5	from sqlalchemy import text
+     6	from sqlalchemy.exc import SQLAlchemyError
+     7	from sqlalchemy.orm import Session
+     8	
+     9	from app.config import Settings, get_settings
+    10	from app.db import get_session
+    11	from app.schemas import BulkPaymentRequest
+    12	from app.service import build_command, execute_bulk_payment
+    13	
+    14	BULK_PAYMENTS_PATH = "/bulk-payments"
+    15	
+    16	router = APIRouter()
+    17	
+    18	
+    19	@router.get("/healthz")
+    20	def healthz(
+    21	    response: Response, session: Annotated[Session, Depends(get_session)]
+    22	) -> dict[str, str]:
+    23	    try:
+    24	        session.execute(text("SELECT 1"))
+    25	    except SQLAlchemyError:
+    26	        response.status_code = 503
+    27	        return {"status": "unavailable"}
+    28	    return {"status": "ok"}
+    29	
+    30	
+    31	@router.post(BULK_PAYMENTS_PATH, status_code=201)
+    32	def create_bulk_payment(
+    33	    payload: BulkPaymentRequest,
+    34	    request: Request,
+    35	    session: Annotated[Session, Depends(get_session)],
+    36	    settings: Annotated[Settings, Depends(get_settings)],
+    37	) -> JSONResponse:
+    38	    # Fields for the per-request log record written in app.main.
+    39	    request.state.payer = str(payload.payer_firm_uuid)
+    40	    request.state.payment_count = len(payload.payments)
+    41	    # Spec 8.1: if the header is sent more than once, the first value is used.
+    42	    keys = request.headers.getlist("Idempotency-Key")
+    43	    command = build_command(payload, keys[0] if keys else None, settings)
+    44	    request.state.total_cents = command.total_cents
+    45	
+    46	    result = execute_bulk_payment(session, command, settings.lock_timeout_ms)
+    47	    request.state.outcome = "replayed" if result.replayed else "created"
+    48	    # The original and the replay are serialized the same way, so the bytes match.
+    49	    headers = {"Idempotent-Replayed": "true"} if result.replayed else None
+    50	    return JSONResponse(result.body, status_code=201, headers=headers)
+=== app/config.py
+     1	from functools import lru_cache
+     2	
+     3	from pydantic_settings import BaseSettings
+     4	
+     5	
+     6	class Settings(BaseSettings):
+     7	    database_url: str
+     8	    max_payments_per_request: int = 1000
+     9	    max_description_length: int = 500
+    10	    lock_timeout_ms: int = 5000
+    11	    db_pool_size: int = 10
+    12	    db_pool_timeout_s: int = 5
+    13	
+    14	
+    15	@lru_cache
+    16	def get_settings() -> Settings:
+    17	    return Settings()
+=== app/db.py
+     1	import threading
+     2	from collections.abc import Iterator
+     3	
+     4	from sqlalchemy import Engine, create_engine
+     5	from sqlalchemy.orm import Session, sessionmaker
+     6	
+     7	from app.config import get_settings
+     8	
+     9	# One engine per process: its pool bounds the process's connections (spec section 9.3).
+    10	# lru_cache would not do: concurrent first calls each run the wrapped function.
+    11	_engine: Engine | None = None
+    12	_engine_lock = threading.Lock()
+    13	
+    14	
+    15	def _create_engine() -> Engine:
+    16	    settings = get_settings()
+    17	    return create_engine(
+    18	        settings.database_url,
+    19	        pool_size=settings.db_pool_size,
+    20	        max_overflow=0,
+    21	        pool_timeout=settings.db_pool_timeout_s,
+    22	        pool_pre_ping=True,
+    23	        # Error text must not carry bound parameters: they include payment
+    24	        # descriptions, which never go to logs (spec section 12).
+    25	        hide_parameters=True,
+    26	    )
+    27	
+    28	
+    29	def get_engine() -> Engine:
+    30	    global _engine
+    31	    engine = _engine
+    32	    if engine is None:
+    33	        with _engine_lock:
+    34	            if _engine is None:
+    35	                _engine = _create_engine()
+    36	            engine = _engine
+    37	    return engine
+    38	
+    39	
+    40	def get_session() -> Iterator[Session]:
+    41	    factory = sessionmaker(bind=get_engine(), expire_on_commit=False)
+    42	    with factory() as session:
+    43	        yield session
+=== app/errors.py
+     1	from typing import Any, ClassVar
+     2	
+     3	
+     4	class DomainError(Exception):
+     5	    """A rejection with a stable error code; the HTTP layer maps it to a response."""
+     6	
+     7	    code: ClassVar[str]
+     8	    status_code: ClassVar[int] = 422
+     9	
+    10	    def __init__(self, message: str) -> None:
+    11	        super().__init__(message)
+    12	        self.message = message
+    13	
+    14	
+    15	class ValidationFailed(DomainError):
+    16	    code = "validation_error"
+    17	
+    18	    def __init__(self, message: str, details: list[dict[str, Any]]) -> None:
+    19	        super().__init__(message)
+    20	        self.details = details
+    21	
+    22	
+    23	class SelfPayment(DomainError):
+    24	    code = "self_payment"
+    25	
+    26	
+    27	class FirmNotFound(DomainError):
+    28	    code = "firm_not_found"
+    29	
+    30	
+    31	class InsufficientFunds(DomainError):
+    32	    code = "insufficient_funds"
+    33	
+    34	
+    35	class BalanceOverflow(DomainError):
+    36	    code = "balance_overflow"
+    37	
+    38	
+    39	class IdempotencyKeyReuse(DomainError):
+    40	    code = "idempotency_key_reuse"
+    41	
+    42	
+    43	class ServiceBusy(DomainError):
+    44	    code = "busy"
+    45	    status_code = 503
+=== app/idempotency.py
+     1	import hashlib
+     2	import json
+     3	from collections.abc import Sequence
+     4	from typing import Any, cast
+     5	
+     6	from sqlalchemy import select, update
+     7	from sqlalchemy.dialects.postgresql import insert
+     8	from sqlalchemy.orm import Session
+     9	
+    10	from app.errors import IdempotencyKeyReuse
+    11	from app.models import IdempotencyKey
+    12	
+    13	
+    14	def compute_request_hash(payer_uuid: str, items: Sequence[tuple[str, int, str]]) -> str:
+    15	    """SHA-256 of the parsed request; items are (payee_uuid, amount_cents, description).
+    16	
+    17	    The canonical form must never change: stored hashes have to stay comparable.
+    18	    """
+    19	    canonical = json.dumps(
+    20	        {"payer": payer_uuid, "payments": [list(item) for item in items]},
+    21	        sort_keys=True,
+    22	        separators=(",", ":"),
+    23	        ensure_ascii=False,
+    24	    )
+    25	    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    26	
+    27	
+    28	def claim_key(
+    29	    session: Session, payer_uuid: str, key: str, request_hash: str
+    30	) -> dict[str, Any] | None:
+    31	    """Claim the key for this transaction, or return the response stored under it.
+    32	
+    33	    Returns None when the key is new. If another transaction holds an uncommitted
+    34	    row for the key, the insert waits for its outcome (bounded by lock_timeout):
+    35	    after a commit the stored response is returned, after a rollback the key is
+    36	    claimed here.
+    37	    """
+    38	    claimed_id = session.execute(
+    39	        # response_body is left out: SQLAlchemy's JSON type would store None as JSON null.
+    40	        insert(IdempotencyKey)
+    41	        .values(payer_firm_uuid=payer_uuid, key=key, request_hash=request_hash)
+    42	        .on_conflict_do_nothing(index_elements=["payer_firm_uuid", "key"])
+    43	        .returning(IdempotencyKey.id)
+    44	    ).scalar_one_or_none()
+    45	    if claimed_id is not None:
+    46	        return None
+    47	
+    48	    # A new statement: under Read Committed it sees the row that won the conflict.
+    49	    existing = session.execute(
+    50	        select(IdempotencyKey.request_hash, IdempotencyKey.response_body).where(
+    51	            IdempotencyKey.payer_firm_uuid == payer_uuid, IdempotencyKey.key == key
+    52	        )
+    53	    ).one()
+    54	    if existing.response_body is None:
+    55	        # The row and its response are committed together, so this cannot happen.
+    56	        raise RuntimeError("a committed idempotency key has no stored response")
+    57	    if existing.request_hash != request_hash:
+    58	        raise IdempotencyKeyReuse("the Idempotency-Key was already used with a different request")
+    59	    return cast(dict[str, Any], existing.response_body)
+    60	
+    61	
+    62	def store_response(session: Session, payer_uuid: str, key: str, body: dict[str, Any]) -> None:
+    63	    """Store the 201 body under a key this transaction has claimed."""
+    64	    session.execute(
+    65	        update(IdempotencyKey)
+    66	        .where(IdempotencyKey.payer_firm_uuid == payer_uuid, IdempotencyKey.key == key)
+    67	        .values(response_body=body)
+    68	    )
+=== app/models.py
+     1	from datetime import datetime
+     2	from typing import Any
+     3	
+     4	from sqlalchemy import (
+     5	    JSON,
+     6	    BigInteger,
+     7	    DateTime,
+     8	    ForeignKey,
+     9	    Identity,
+    10	    Integer,
+    11	    Text,
+    12	    UniqueConstraint,
+    13	    func,
+    14	)
+    15	from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+    16	
+    17	
+    18	class Base(DeclarativeBase):
+    19	    pass
+    20	
+    21	
+    22	class Firm(Base):
+    23	    __tablename__ = "firms"
+    24	    __table_args__ = (UniqueConstraint("uuid", name="uq_firms_uuid"),)
+    25	
+    26	    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    27	    name: Mapped[str] = mapped_column(Text)
+    28	    balance_cents: Mapped[int] = mapped_column(Integer)
+    29	    uuid: Mapped[str] = mapped_column(Text)
+    30	
+    31	
+    32	class Payment(Base):
+    33	    __tablename__ = "payments"
+    34	
+    35	    id: Mapped[int] = mapped_column(Integer, Identity(always=False), primary_key=True)
+    36	    payer_firm_id: Mapped[int] = mapped_column(ForeignKey("firms.id"))
+    37	    payee_firm_id: Mapped[int] = mapped_column(ForeignKey("firms.id"))
+    38	    amount_cents: Mapped[int] = mapped_column(Integer)
+    39	    description: Mapped[str] = mapped_column(Text)
+    40	
+    41	
+    42	class IdempotencyKey(Base):
+    43	    __tablename__ = "idempotency_keys"
+    44	    __table_args__ = (UniqueConstraint("payer_firm_uuid", "key", name="uq_idempotency_keys"),)
+    45	
+    46	    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    47	    payer_firm_uuid: Mapped[str] = mapped_column(Text)
+    48	    key: Mapped[str] = mapped_column(Text)
+    49	    request_hash: Mapped[str] = mapped_column(Text)
+    50	    response_body: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    51	    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+=== app/schemas.py
+     1	import re
+     2	from typing import Annotated
+     3	from uuid import UUID
+     4	
+     5	from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictStr
+     6	
+     7	INT32_MAX = 2_147_483_647
+     8	
+     9	# 8 integer digits, a point and 2 decimals is the longest amount that fits INT32_MAX cents.
+    10	_MAX_AMOUNT_LENGTH = 11
+    11	# [0-9], not \d: \d also matches digits from other scripts.
+    12	_AMOUNT_PATTERN = re.compile(r"[0-9]+(\.[0-9]{1,2})?")
+    13	
+    14	
+    15	def parse_amount_cents(value: str) -> int:
+    16	    """Convert a decimal amount string such as "5800.5" to integer cents."""
+    17	    if len(value) > _MAX_AMOUNT_LENGTH:
+    18	        raise ValueError(f"amount must be at most {_MAX_AMOUNT_LENGTH} characters long")
+    19	    if _AMOUNT_PATTERN.fullmatch(value) is None:
+    20	        raise ValueError("amount must be digits with an optional point and 1 or 2 decimals")
+    21	    whole, _, fraction = value.partition(".")
+    22	    cents = int(whole) * 100 + int(fraction.ljust(2, "0"))
+    23	    if not 0 < cents <= INT32_MAX:
+    24	        raise ValueError(f"amount must be greater than 0 and at most {format_cents(INT32_MAX)}")
+    25	    return cents
+    26	
+    27	
+    28	def format_cents(cents: int) -> str:
+    29	    """Render non-negative integer cents as a decimal string with exactly two decimals."""
+    30	    return f"{cents // 100}.{cents % 100:02d}"
+    31	
+    32	
+    33	def _check_amount(value: str) -> str:
+    34	    parse_amount_cents(value)
+    35	    return value
+    36	
+    37	
+    38	def _check_description(value: str) -> str:
+    39	    # PostgreSQL TEXT cannot store U+0000.
+    40	    if "\x00" in value:
+    41	        raise ValueError("description must not contain the character U+0000")
+    42	    # A lone surrogate (from a JSON escape such as \ud800) cannot be encoded
+    43	    # for the request hash or the database.
+    44	    try:
+    45	        value.encode("utf-8")
+    46	    except UnicodeEncodeError:
+    47	        raise ValueError("description must not contain unpaired surrogates") from None
+    48	    return value
+    49	
+    50	
+    51	class PaymentIn(BaseModel):
+    52	    model_config = ConfigDict(extra="forbid")
+    53	
+    54	    amount: Annotated[StrictStr, AfterValidator(_check_amount)]
+    55	    payee_firm_uuid: UUID
+    56	    description: Annotated[StrictStr, AfterValidator(_check_description)]
+    57	
+    58	
+    59	class BulkPaymentRequest(BaseModel):
+    60	    """The request body; limits that depend on settings are checked in build_command."""
+    61	
+    62	    model_config = ConfigDict(extra="forbid")
+    63	
+    64	    payer_firm_uuid: UUID
+    65	    payments: Annotated[list[PaymentIn], Field(min_length=1)]
+=== app/service.py
+     1	import logging
+     2	import re
+     3	from dataclasses import dataclass
+     4	from typing import Any
+     5	
+     6	from sqlalchemy import select, text
+     7	from sqlalchemy.exc import DBAPIError
+     8	from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+     9	from sqlalchemy.orm import Session
+    10	
+    11	from app.config import Settings
+    12	from app.errors import (
+    13	    BalanceOverflow,
+    14	    FirmNotFound,
+    15	    InsufficientFunds,
+    16	    SelfPayment,
+    17	    ServiceBusy,
+    18	    ValidationFailed,
+    19	)
+    20	from app.idempotency import claim_key, compute_request_hash, store_response
+    21	from app.models import Firm, Payment
+    22	from app.schemas import INT32_MAX, BulkPaymentRequest, format_cents, parse_amount_cents
+    23	
+    24	logger = logging.getLogger(__name__)
+    25	
+    26	_LOCK_NOT_AVAILABLE = "55P03"
+    27	_DEADLOCK_DETECTED = "40P01"
+    28	
+    29	# Visible ASCII, no spaces.
+    30	_IDEMPOTENCY_KEY_PATTERN = re.compile(r"[\x21-\x7e]{1,255}")
+    31	
+    32	
+    33	@dataclass(frozen=True)
+    34	class PaymentItem:
+    35	    payee_uuid: str
+    36	    amount_cents: int
+    37	    description: str
+    38	
+    39	
+    40	@dataclass(frozen=True)
+    41	class BulkPaymentCommand:
+    42	    payer_uuid: str
+    43	    items: tuple[PaymentItem, ...]
+    44	    total_cents: int
+    45	    credits: dict[str, int]
+    46	    firm_uuids: frozenset[str]
+    47	    idempotency_key: str | None
+    48	    request_hash: str | None
+    49	
+    50	
+    51	def _detail(loc: list[str | int], msg: str, type_: str) -> dict[str, Any]:
+    52	    return {"loc": loc, "msg": msg, "type": type_}
+    53	
+    54	
+    55	def build_command(
+    56	    request: BulkPaymentRequest, idempotency_key: str | None, settings: Settings
+    57	) -> BulkPaymentCommand:
+    58	    """Check the rules the schema cannot and derive what the transaction needs.
+    59	
+    60	    Pure: no database access.
+    61	    """
+    62	    max_payments = settings.max_payments_per_request
+    63	    if len(request.payments) > max_payments:
+    64	        msg = f"at most {max_payments} payments are allowed per request"
+    65	        raise ValidationFailed(msg, [_detail(["body", "payments"], msg, "too_long")])
+    66	
+    67	    max_length = settings.max_description_length
+    68	    msg = f"description must be at most {max_length} characters long"
+    69	    too_long = [
+    70	        _detail(["body", "payments", index, "description"], msg, "string_too_long")
+    71	        for index, payment in enumerate(request.payments)
+    72	        if len(payment.description) > max_length
+    73	    ]
+    74	    if too_long:
+    75	        raise ValidationFailed(msg, too_long)
+    76	
+    77	    if idempotency_key is not None and _IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
+    78	        msg = "Idempotency-Key must be 1 to 255 visible ASCII characters without spaces"
+    79	        detail = _detail(["header", "Idempotency-Key"], msg, "string_pattern_mismatch")
+    80	        raise ValidationFailed(msg, [detail])
+    81	
+    82	    payer_uuid = str(request.payer_firm_uuid)
+    83	    items = tuple(
+    84	        PaymentItem(
+    85	            payee_uuid=str(payment.payee_firm_uuid),
+    86	            amount_cents=parse_amount_cents(payment.amount),
+    87	            description=payment.description,
+    88	        )
+    89	        for payment in request.payments
+    90	    )
+    91	
+    92	    for index, item in enumerate(items):
+    93	        if item.payee_uuid == payer_uuid:
+    94	            raise SelfPayment(f"payment {index} pays the payer itself")
+    95	
+    96	    total_cents = sum(item.amount_cents for item in items)
+    97	    if total_cents > INT32_MAX:
+    98	        msg = f"the batch total must be at most {format_cents(INT32_MAX)}"
+    99	        raise ValidationFailed(msg, [_detail(["body", "payments"], msg, "less_than_equal")])
+   100	
+   101	    credits: dict[str, int] = {}
+   102	    for item in items:
+   103	        credits[item.payee_uuid] = credits.get(item.payee_uuid, 0) + item.amount_cents
+   104	
+   105	    firm_uuids = frozenset({payer_uuid, *credits})
+   106	
+   107	    request_hash = None
+   108	    if idempotency_key is not None:
+   109	        request_hash = compute_request_hash(
+   110	            payer_uuid, [(item.payee_uuid, item.amount_cents, item.description) for item in items]
+   111	        )
+   112	
+   113	    return BulkPaymentCommand(
+   114	        payer_uuid=payer_uuid,
+   115	        items=items,
+   116	        total_cents=total_cents,
+   117	        credits=credits,
+   118	        firm_uuids=firm_uuids,
+   119	        idempotency_key=idempotency_key,
+   120	        request_hash=request_hash,
+   121	    )
+   122	
+   123	
+   124	@dataclass(frozen=True)
+   125	class BulkPaymentResult:
+   126	    body: dict[str, Any]
+   127	    replayed: bool
+   128	
+   129	
+   130	def execute_bulk_payment(
+   131	    session: Session, command: BulkPaymentCommand, lock_timeout_ms: int
+   132	) -> BulkPaymentResult:
+   133	    """Apply the whole batch in one transaction, or reject it and change nothing.
+   134	
+   135	    The session must not be in a transaction yet; this function owns it.
+   136	    """
+   137	    try:
+   138	        with session.begin():
+   139	            result = _apply(session, command, lock_timeout_ms)
+   140	    except DBAPIError as exc:
+   141	        sqlstate = getattr(exc.orig, "sqlstate", None)
+   142	        if sqlstate == _DEADLOCK_DETECTED:
+   143	            # Locks are taken in one query ordered by id, so this should not happen.
+   144	            # exc.orig, not exc: the SQLAlchemy message carries the statement
+   145	            # parameters, and those include payment descriptions.
+   146	            logger.error("deadlock detected in a bulk payment transaction: %s", exc.orig)
+   147	        if sqlstate in (_LOCK_NOT_AVAILABLE, _DEADLOCK_DETECTED):
+   148	            raise ServiceBusy("the payment could not be processed in time; retry") from exc
+   149	        raise
+   150	    except PoolTimeoutError as exc:
+   151	        raise ServiceBusy("no database connection is available; retry") from exc
+   152	    return result
+   153	
+   154	
+   155	def _apply(
+   156	    session: Session, command: BulkPaymentCommand, lock_timeout_ms: int
+   157	) -> BulkPaymentResult:
+   158	    """Transaction steps of spec section 8.2; only database work happens here."""
+   159	    session.execute(
+   160	        text("SELECT set_config('lock_timeout', :value, true)"),
+   161	        {"value": f"{lock_timeout_ms}ms"},
+   162	    )
+   163	
+   164	    key = command.idempotency_key
+   165	    if key is not None:
+   166	        assert command.request_hash is not None  # build_command sets both or neither
+   167	        # Claimed before any firm is read: a second request with this key waits
+   168	        # here for the outcome of the first.
+   169	        stored = claim_key(session, command.payer_uuid, key, command.request_hash)
+   170	        if stored is not None:
+   171	            return BulkPaymentResult(body=stored, replayed=True)
+   172	
+   173	    # The only read of firms: it finds, checks and locks them in one consistent order.
+   174	    locked = session.scalars(
+   175	        select(Firm)
+   176	        .where(Firm.uuid.in_(command.firm_uuids))
+   177	        .order_by(Firm.id)
+   178	        .with_for_update(key_share=True)
+   179	        .execution_options(populate_existing=True)
+   180	    ).all()
+   181	    firms = {firm.uuid: firm for firm in locked}
+   182	
+   183	    missing = command.firm_uuids - firms.keys()
+   184	    if missing:
+   185	        raise FirmNotFound(f"firms not found: {', '.join(sorted(missing))}")
+   186	
+   187	    payer = firms[command.payer_uuid]
+   188	    if payer.balance_cents < command.total_cents:
+   189	        raise InsufficientFunds("the payer's balance does not cover the batch total")
+   190	
+   191	    for payee_uuid, credit in command.credits.items():
+   192	        if firms[payee_uuid].balance_cents + credit > INT32_MAX:
+   193	            raise BalanceOverflow(f"the balance of payee {payee_uuid} would exceed the maximum")
+   194	
+   195	    rows = [
+   196	        Payment(
+   197	            payer_firm_id=payer.id,
+   198	            payee_firm_id=firms[item.payee_uuid].id,
+   199	            amount_cents=item.amount_cents,
+   200	            description=item.description,
+   201	        )
+   202	        for item in command.items
+   203	    ]
+   204	    session.add_all(rows)
+   205	    session.flush()
+   206	
+   207	    payer.balance_cents -= command.total_cents
+   208	    for payee_uuid, credit in command.credits.items():
+   209	        firms[payee_uuid].balance_cents += credit
+   210	
+   211	    body: dict[str, Any] = {
+   212	        "payer_firm_uuid": command.payer_uuid,
+   213	        "total_amount": format_cents(command.total_cents),
+   214	        "payments": [
+   215	            {
+   216	                "id": row.id,
+   217	                "payee_firm_uuid": item.payee_uuid,
+   218	                "amount": format_cents(item.amount_cents),
+   219	                "description": item.description,
+   220	            }
+   221	            for row, item in zip(rows, command.items, strict=True)
+   222	        ],
+   223	    }
+   224	
+   225	    if key is not None:
+   226	        # Balance updates go out first, so storing the response is the last statement.
+   227	        session.flush()
+   228	        store_response(session, command.payer_uuid, key, body)
+   229	    return BulkPaymentResult(body=body, replayed=False)

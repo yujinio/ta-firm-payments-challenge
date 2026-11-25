@@ -1,0 +1,850 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up -d --wait db
+      - run: make check
+=== tests/conftest.py
+     1	import json
+     2	import os
+     3	import uuid
+     4	from collections.abc import Iterator
+     5	from pathlib import Path
+     6	
+     7	os.environ["DATABASE_URL"] = os.environ.get(
+     8	    "TEST_DATABASE_URL",
+     9	    "postgresql+psycopg://postgres:postgres@localhost:5432/firm_payments_test",
+    10	)
+    11	
+    12	import pytest  # noqa: E402
+    13	from alembic import command  # noqa: E402
+    14	from alembic.config import Config  # noqa: E402
+    15	from fastapi.testclient import TestClient  # noqa: E402
+    16	from sqlalchemy import text  # noqa: E402
+    17	from sqlalchemy.orm import Session  # noqa: E402
+    18	
+    19	from app.db import get_engine  # noqa: E402
+    20	from app.main import app  # noqa: E402
+    21	
+    22	ROOT = Path(__file__).resolve().parent.parent
+    23	UNIT_DIR = Path(__file__).resolve().parent / "unit"
+    24	
+    25	PINECREST = "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41"
+    26	LOPEZ = "8b2e4c71-0d3a-4f6e-b1c9-5a7d2e9f4c10"
+    27	NAIR = "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25"
+    28	
+    29	SAMPLE_REQUEST = json.loads((ROOT / "sample-request.json").read_text())
+    30	FORMAT_EXAMPLE_REQUEST = json.loads((ROOT / "format-example-request.json").read_text())
+    31	
+    32	SEED_SQL = (ROOT / "scripts" / "seed.sql").read_text()
+    33	
+    34	
+    35	def alembic_config() -> Config:
+    36	    return Config(str(ROOT / "alembic.ini"))
+    37	
+    38	
+    39	def _is_unit_test(request: pytest.FixtureRequest) -> bool:
+    40	    return UNIT_DIR in Path(str(request.path)).parents
+    41	
+    42	
+    43	@pytest.fixture(scope="session")
+    44	def _schema() -> None:
+    45	    command.upgrade(alembic_config(), "head")
+    46	
+    47	
+    48	@pytest.fixture(autouse=True)
+    49	def _fresh_data(request: pytest.FixtureRequest) -> None:
+    50	    """Migrate once per session, then reset and seed the data before every non-unit test."""
+    51	    if _is_unit_test(request):
+    52	        return
+    53	    request.getfixturevalue("_schema")
+    54	    with get_engine().begin() as conn:
+    55	        conn.exec_driver_sql("TRUNCATE payments, idempotency_keys, firms RESTART IDENTITY CASCADE")
+    56	        conn.exec_driver_sql(SEED_SQL)
+    57	
+    58	
+    59	@pytest.fixture
+    60	def client() -> Iterator[TestClient]:
+    61	    with TestClient(app, raise_server_exceptions=False) as c:
+    62	        yield c
+    63	
+    64	
+    65	@pytest.fixture
+    66	def db() -> Iterator[Session]:
+    67	    with Session(get_engine(), expire_on_commit=False) as session:
+    68	        yield session
+    69	
+    70	
+    71	def balances(db: Session) -> dict[str, int]:
+    72	    rows = db.execute(text("SELECT uuid, balance_cents FROM firms")).all()
+    73	    return {u: cents for u, cents in rows}
+    74	
+    75	
+    76	def payment_rows(db: Session) -> list[tuple[int, int, int, str]]:
+    77	    rows = db.execute(
+    78	        text(
+    79	            "SELECT payer_firm_id, payee_firm_id, amount_cents, description"
+    80	            " FROM payments ORDER BY id"
+    81	        )
+    82	    ).all()
+    83	    return [(a, b, c, d) for a, b, c, d in rows]
+    84	
+    85	
+    86	def add_firm(db: Session, firm_id: int, balance_cents: int) -> str:
+    87	    firm_uuid = str(uuid.uuid4())
+    88	    db.execute(
+    89	        text("INSERT INTO firms (id, name, balance_cents, uuid) VALUES (:i, :n, :b, :u)"),
+    90	        {"i": firm_id, "n": f"Firm {firm_id}", "b": balance_cents, "u": firm_uuid},
+    91	    )
+    92	    db.commit()
+    93	    return firm_uuid
+    94	
+    95	
+    96	def set_balance(db: Session, uuid: str, balance_cents: int) -> None:
+    97	    db.execute(
+    98	        text("UPDATE firms SET balance_cents = :b WHERE uuid = :u"),
+    99	        {"b": balance_cents, "u": uuid},
+   100	    )
+   101	    db.commit()
+   102	
+   103	
+   104	def bulk(payer: str, *payments: tuple[str, str]) -> dict:
+   105	    return {
+   106	        "payer_firm_uuid": payer,
+   107	        "payments": [
+   108	            {"amount": amount, "payee_firm_uuid": payee, "description": f"p{i}"}
+   109	            for i, (payee, amount) in enumerate(payments, start=1)
+   110	        ],
+   111	    }
+=== tests/concurrency/conftest.py
+     1	import threading
+     2	import time
+     3	from collections.abc import Callable, Iterator
+     4	from concurrent.futures import ThreadPoolExecutor
+     5	from typing import Any
+     6	
+     7	import pytest
+     8	from sqlalchemy import Engine, create_engine, text
+     9	from sqlalchemy.orm import Session
+    10	
+    11	from app.config import get_settings
+    12	from app.errors import DomainError
+    13	from app.schemas import BulkPaymentRequest
+    14	from app.service import BulkPaymentResult, build_command, execute_bulk_payment
+    15	from tests.conftest import SEED_SQL
+    16	
+    17	# The largest thread count any concurrency test uses. Every thread gets its own
+    18	# pooled connection without waiting, so a pool wait never shows up as "busy".
+    19	MAX_THREADS = 50
+    20	THREAD_TIMEOUT_S = 60.0
+    21	
+    22	SERVICE_ENGINE: Engine = create_engine(
+    23	    get_settings().database_url,
+    24	    pool_size=MAX_THREADS,
+    25	    max_overflow=0,
+    26	    pool_timeout=30,
+    27	    hide_parameters=True,
+    28	)
+    29	
+    30	
+    31	@pytest.fixture(scope="module", autouse=True)
+    32	def _close_service_connections() -> Iterator[None]:
+    33	    """Do not keep MAX_THREADS idle connections open beyond the module that used them."""
+    34	    yield
+    35	    SERVICE_ENGINE.dispose()
+    36	
+    37	
+    38	def run_concurrently[T](fn: Callable[[int], T], n: int) -> list[T]:
+    39	    """Run fn(0) .. fn(n - 1) on n threads released together; re-raise the first exception."""
+    40	    barrier = threading.Barrier(n, timeout=THREAD_TIMEOUT_S)
+    41	
+    42	    def start(index: int) -> T:
+    43	        barrier.wait()
+    44	        return fn(index)
+    45	
+    46	    with ThreadPoolExecutor(max_workers=n) as executor:
+    47	        futures = [executor.submit(start, index) for index in range(n)]
+    48	        return [future.result(timeout=THREAD_TIMEOUT_S) for future in futures]
+    49	
+    50	
+    51	def run_service(
+    52	    payload: dict[str, Any], key: str | None = None, lock_timeout_ms: int = 5000
+    53	) -> BulkPaymentResult:
+    54	    """Run one request through the service on a connection of its own; errors propagate."""
+    55	    command = build_command(BulkPaymentRequest.model_validate(payload), key, get_settings())
+    56	    with Session(SERVICE_ENGINE, expire_on_commit=False) as session:
+    57	        return execute_bulk_payment(session, command, lock_timeout_ms)
+    58	
+    59	
+    60	def call_service(
+    61	    payload: dict[str, Any], key: str | None = None, lock_timeout_ms: int = 5000
+    62	) -> tuple[str, dict[str, Any] | None]:
+    63	    """Return ("created" | "replayed", body), or (error code, None) for a domain error."""
+    64	    try:
+    65	        result = run_service(payload, key, lock_timeout_ms)
+    66	    except DomainError as error:
+    67	        return error.code, None
+    68	    return ("replayed" if result.replayed else "created"), result.body
+    69	
+    70	
+    71	def reset_data(db: Session) -> None:
+    72	    """Back to the seeded state, through db itself so its open transaction cannot block it."""
+    73	    db.execute(text("TRUNCATE payments, idempotency_keys, firms RESTART IDENTITY CASCADE"))
+    74	    db.connection().exec_driver_sql(SEED_SQL)
+    75	    db.commit()
+    76	
+    77	
+    78	def assert_ledger_consistent(db: Session, start: dict[str, int]) -> None:
+    79	    """I-1 and I-2, and every balance explained by the payments rows."""
+    80	    rows = db.execute(
+    81	        text(
+    82	            "SELECT f.uuid, f.balance_cents,"
+    83	            " (SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE payer_firm_id = f.id),"
+    84	            " (SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE payee_firm_id = f.id)"
+    85	            " FROM firms f"
+    86	        )
+    87	    ).all()
+    88	    current = {firm_uuid: balance for firm_uuid, balance, _, _ in rows}
+    89	    assert current.keys() == start.keys()
+    90	    negative = {firm_uuid: balance for firm_uuid, balance in current.items() if balance < 0}
+    91	    assert not negative, f"I-1 violated: {negative}"
+    92	    assert sum(current.values()) == sum(start.values()), "I-2 violated: the sum of balances moved"
+    93	    for firm_uuid, balance, paid, received in rows:
+    94	        assert balance == start[firm_uuid] - paid + received, f"ledger mismatch for {firm_uuid}"
+    95	
+    96	
+    97	def wait_until_blocked(db: Session, timeout_s: float = 5.0) -> None:
+    98	    """Return once another backend of this database waits for a lock; fail on timeout."""
+    99	    deadline = time.monotonic() + timeout_s
+   100	    while True:
+   101	        waiting = db.execute(
+   102	            text(
+   103	                "SELECT count(*) FROM pg_stat_activity"
+   104	                " WHERE datname = current_database() AND pid <> pg_backend_pid()"
+   105	                " AND wait_event_type = 'Lock'"
+   106	            )
+   107	        ).scalar_one()
+   108	        # pg_stat_activity is a snapshot per transaction: end it before the next poll.
+   109	        db.rollback()
+   110	        if waiting:
+   111	            return
+   112	        if time.monotonic() > deadline:
+   113	            pytest.fail(f"no backend waited for a lock within {timeout_s} s")
+   114	        time.sleep(0.01)
+=== tests/concurrency/test_locks.py
+     1	"""Deterministic lock behavior: waits, timeouts, pool exhaustion and statement order."""
+     2	
+     3	import re
+     4	import time
+     5	from collections.abc import Iterator
+     6	from concurrent.futures import ThreadPoolExecutor
+     7	from contextlib import contextmanager
+     8	
+     9	import anyio
+    10	import anyio.to_thread
+    11	import pytest
+    12	from sqlalchemy import Connection, create_engine, event, text
+    13	from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+    14	from sqlalchemy.orm import Session
+    15	
+    16	from app.config import get_settings
+    17	from app.db import get_engine
+    18	from app.errors import ServiceBusy
+    19	from app.main import app
+    20	from app.schemas import BulkPaymentRequest
+    21	from app.service import build_command, execute_bulk_payment
+    22	from tests.concurrency.conftest import (
+    23	    assert_ledger_consistent,
+    24	    call_service,
+    25	    run_service,
+    26	    wait_until_blocked,
+    27	)
+    28	from tests.conftest import (
+    29	    LOPEZ,
+    30	    NAIR,
+    31	    PINECREST,
+    32	    SAMPLE_REQUEST,
+    33	    balances,
+    34	    bulk,
+    35	    payment_rows,
+    36	)
+    37	
+    38	LOCK_LOPEZ = "SELECT 1 FROM firms WHERE id = 2 FOR UPDATE"
+    39	LOPEZ_PAYS_NAIR = bulk(LOPEZ, (NAIR, "400"))
+    40	SHORT_TIMEOUT_MS = 200
+    41	LOCK_NOT_AVAILABLE = "55P03"
+    42	
+    43	
+    44	@contextmanager
+    45	def other_transaction(statement: str, **params: object) -> Iterator[Connection]:
+    46	    """Another session's open transaction that has run statement; rolled back on exit
+    47	    unless the caller commits first."""
+    48	    with get_engine().connect() as conn:
+    49	        conn.execute(text(statement), params)
+    50	        yield conn
+    51	
+    52	
+    53	INSERT_PENDING_KEY = (
+    54	    "INSERT INTO idempotency_keys (payer_firm_uuid, key, request_hash)"
+    55	    " VALUES (:payer, :key, :request_hash)"
+    56	)
+    57	
+    58	
+    59	def key_rows(db: Session) -> list[tuple[str, object]]:
+    60	    rows = db.execute(text("SELECT key, response_body FROM idempotency_keys ORDER BY id")).all()
+    61	    return [(key, body) for key, body in rows]
+    62	
+    63	
+    64	def busy_sqlstate(error: ServiceBusy) -> str | None:
+    65	    return getattr(getattr(error.__cause__, "orig", None), "sqlstate", None)
+    66	
+    67	
+    68	def test_c4_request_waits_for_row_lock(db):
+    69	    start = balances(db)
+    70	    # The thread is joined only after the other transaction has ended, so a failed
+    71	    # assertion cannot leave it waiting for a lock nobody releases.
+    72	    with ThreadPoolExecutor(max_workers=1) as executor:
+    73	        with other_transaction(LOCK_LOPEZ) as conn:
+    74	            future = executor.submit(call_service, LOPEZ_PAYS_NAIR)
+    75	            wait_until_blocked(db)
+    76	            assert not future.done()
+    77	            conn.execute(text("UPDATE firms SET balance_cents = 30000 WHERE id = 2"))
+    78	            conn.commit()
+    79	        result = future.result(timeout=10)
+    80	
+    81	    # The lock query returned the balance committed while it waited: 300.00 < 400.00.
+    82	    assert result == ("insufficient_funds", None)
+    83	    assert balances(db)[LOPEZ] == 30_000
+    84	    assert payment_rows(db) == []
+    85	    assert_ledger_consistent(db, {**start, LOPEZ: 30_000})
+    86	
+    87	
+    88	def test_c5_lock_timeout(db):
+    89	    before = balances(db)
+    90	    with other_transaction(LOCK_LOPEZ):
+    91	        started = time.monotonic()
+    92	        assert call_service(LOPEZ_PAYS_NAIR, lock_timeout_ms=SHORT_TIMEOUT_MS) == ("busy", None)
+    93	        assert time.monotonic() - started >= SHORT_TIMEOUT_MS / 1000
+    94	        with pytest.raises(ServiceBusy) as excinfo:
+    95	            run_service(LOPEZ_PAYS_NAIR, lock_timeout_ms=SHORT_TIMEOUT_MS)
+    96	
+    97	    assert busy_sqlstate(excinfo.value) == LOCK_NOT_AVAILABLE
+    98	    assert balances(db) == before
+    99	    assert payment_rows(db) == []
+   100	
+   101	
+   102	@pytest.fixture
+   103	def short_lock_timeout() -> Iterator[None]:
+   104	    settings = get_settings().model_copy(update={"lock_timeout_ms": SHORT_TIMEOUT_MS})
+   105	    app.dependency_overrides[get_settings] = lambda: settings
+   106	    try:
+   107	        yield
+   108	    finally:
+   109	        app.dependency_overrides.pop(get_settings, None)
+   110	
+   111	
+   112	def test_c5_http_503(client, db, short_lock_timeout):
+   113	    before = balances(db)
+   114	    with other_transaction(LOCK_LOPEZ):
+   115	        r = client.post("/bulk-payments", json=LOPEZ_PAYS_NAIR)
+   116	
+   117	    assert r.status_code == 503
+   118	    assert r.json()["error"]["code"] == "busy"
+   119	    assert r.headers["Retry-After"] == "1"
+   120	    assert balances(db) == before
+   121	    assert payment_rows(db) == []
+   122	
+   123	
+   124	def test_key_wait_respects_lock_timeout(db):
+   125	    """C8: the wait on the unique index of idempotency_keys is bounded by lock_timeout."""
+   126	    before = balances(db)
+   127	    with other_transaction(INSERT_PENDING_KEY, payer=PINECREST, key="k", request_hash="x"):
+   128	        started = time.monotonic()
+   129	        result = call_service(SAMPLE_REQUEST, key="k", lock_timeout_ms=SHORT_TIMEOUT_MS)
+   130	        assert result == ("busy", None)
+   131	        assert time.monotonic() - started >= SHORT_TIMEOUT_MS / 1000
+   132	        with pytest.raises(ServiceBusy) as excinfo:
+   133	            run_service(SAMPLE_REQUEST, key="k", lock_timeout_ms=SHORT_TIMEOUT_MS)
+   134	
+   135	    assert busy_sqlstate(excinfo.value) == LOCK_NOT_AVAILABLE
+   136	    assert balances(db) == before
+   137	    assert payment_rows(db) == []
+   138	    assert key_rows(db) == []
+   139	
+   140	
+   141	def test_key_wait_then_rollback_executes(db):
+   142	    """Spec 8.3: if the transaction holding the key rolls back, the waiting request runs."""
+   143	    start = balances(db)
+   144	    with ThreadPoolExecutor(max_workers=1) as executor:
+   145	        with other_transaction(INSERT_PENDING_KEY, payer=PINECREST, key="k", request_hash="x"):
+   146	            future = executor.submit(call_service, SAMPLE_REQUEST, "k")
+   147	            wait_until_blocked(db)
+   148	            assert not future.done()
+   149	        # Leaving the block rolled the other transaction back.
+   150	        outcome, body = future.result(timeout=10)
+   151	
+   152	    assert outcome == "created"
+   153	    assert balances(db)[PINECREST] == 3_674_875
+   154	    assert len(payment_rows(db)) == 3
+   155	    assert key_rows(db) == [("k", body)]
+   156	    assert_ledger_consistent(db, start)
+   157	
+   158	
+   159	def test_key_wait_then_commit_replays(db):
+   160	    """Spec 8.3: if the transaction holding the key commits, the waiting request gets
+   161	    the stored response and changes nothing."""
+   162	    before = balances(db)
+   163	    command = build_command(BulkPaymentRequest.model_validate(SAMPLE_REQUEST), "k", get_settings())
+   164	    with ThreadPoolExecutor(max_workers=1) as executor:
+   165	        with other_transaction(
+   166	            INSERT_PENDING_KEY, payer=PINECREST, key="k", request_hash=command.request_hash
+   167	        ) as conn:
+   168	            future = executor.submit(call_service, SAMPLE_REQUEST, "k")
+   169	            wait_until_blocked(db)
+   170	            assert not future.done()
+   171	            conn.execute(
+   172	                text("UPDATE idempotency_keys SET response_body = :body WHERE key = 'k'"),
+   173	                {"body": '{"stored": true}'},
+   174	            )
+   175	            conn.commit()
+   176	        result = future.result(timeout=10)
+   177	
+   178	    assert result == ("replayed", {"stored": True})
+   179	    assert balances(db) == before
+   180	    assert payment_rows(db) == []
+   181	
+   182	
+   183	def test_pool_exhaustion_is_busy(db):
+   184	    """C9: no free connection within the pool timeout is busy, not an internal error."""
+   185	    before = balances(db)
+   186	    engine = create_engine(
+   187	        get_settings().database_url,
+   188	        pool_size=1,
+   189	        max_overflow=0,
+   190	        pool_timeout=0.2,
+   191	        hide_parameters=True,
+   192	    )
+   193	    command = build_command(BulkPaymentRequest.model_validate(SAMPLE_REQUEST), None, get_settings())
+   194	    try:
+   195	        with engine.connect(), Session(engine) as session:
+   196	            with pytest.raises(ServiceBusy) as excinfo:
+   197	                execute_bulk_payment(session, command, 5000)
+   198	    finally:
+   199	        engine.dispose()
+   200	
+   201	    assert isinstance(excinfo.value.__cause__, PoolTimeoutError)
+   202	    assert balances(db) == before
+   203	    assert payment_rows(db) == []
+   204	
+   205	
+   206	async def _thread_limit() -> float:
+   207	    return anyio.to_thread.current_default_thread_limiter().total_tokens
+   208	
+   209	
+   210	def test_thread_limit_matches_pool_size(client):
+   211	    """Spec 10: AnyIO allows 40 threads by default; the lifespan lowers it to the pool size."""
+   212	    assert anyio.run(_thread_limit) == 40
+   213	    assert client.portal.call(_thread_limit) == get_settings().db_pool_size
+   214	
+   215	
+   216	# Spec 8.2, steps 1-3 and 7-9: one label per statement the service sends.
+   217	STATEMENT_LABELS = {
+   218	    "set_config": r"SELECT set_config\('lock_timeout', ",
+   219	    "claim_key": r"INSERT INTO idempotency_keys .* ON CONFLICT \(payer_firm_uuid, key\) DO NOTHING",
+   220	    "lock_firms": r"SELECT firms\.id, .* FROM firms WHERE .* ORDER BY firms\.id FOR NO KEY UPDATE$",
+   221	    "insert_payments": r"INSERT INTO payments ",
+   222	    "update_firms": r"UPDATE firms SET balance_cents=",
+   223	    "store_response": r"UPDATE idempotency_keys SET response_body=",
+   224	}
+   225	
+   226	
+   227	def _label(statement: str) -> str:
+   228	    flat = " ".join(statement.split())
+   229	    for label, pattern in STATEMENT_LABELS.items():
+   230	        if re.match(pattern, flat):
+   231	            return label
+   232	    return f"other: {flat[:80]}"
+   233	
+   234	
+   235	@pytest.fixture
+   236	def statements() -> Iterator[tuple[Session, list[str]]]:
+   237	    """A session on an engine of its own that records the label of every statement."""
+   238	    engine = create_engine(get_settings().database_url, hide_parameters=True)
+   239	    seen: list[str] = []
+   240	
+   241	    def record(conn, cursor, statement, parameters, context, executemany) -> None:
+   242	        seen.append(_label(statement))
+   243	
+   244	    event.listen(engine, "before_cursor_execute", record)
+   245	    try:
+   246	        with Session(engine, expire_on_commit=False) as session:
+   247	            yield session, seen
+   248	    finally:
+   249	        event.remove(engine, "before_cursor_execute", record)
+   250	        engine.dispose()
+   251	
+   252	
+   253	@pytest.mark.parametrize(
+   254	    ("key", "expected"),
+   255	    [
+   256	        (
+   257	            "order-1",
+   258	            [
+   259	                "set_config",
+   260	                "claim_key",
+   261	                "lock_firms",
+   262	                "insert_payments",
+   263	                "update_firms",
+   264	                "store_response",
+   265	            ],
+   266	        ),
+   267	        (None, ["set_config", "lock_firms", "insert_payments", "update_firms"]),
+   268	    ],
+   269	    ids=["with_key", "without_key"],
+   270	)
+   271	def test_statement_order(statements, key, expected):
+   272	    """Pins spec 8.2: the key is claimed before any firm is read, firms are read once
+   273	    and locked in id order, and the response is stored after payments and balances."""
+   274	    session, seen = statements
+   275	    command = build_command(BulkPaymentRequest.model_validate(SAMPLE_REQUEST), key, get_settings())
+   276	
+   277	    result = execute_bulk_payment(session, command, 5000)
+   278	
+   279	    assert not result.replayed
+   280	    assert seen == expected
+=== tests/concurrency/test_races.py
+     1	"""Races between in-process requests: threads released together, one connection each."""
+     2	
+     3	import logging
+     4	import random
+     5	from collections import Counter
+     6	
+     7	import pytest
+     8	from sqlalchemy import text
+     9	from sqlalchemy.orm import Session
+    10	
+    11	from tests.concurrency.conftest import (
+    12	    assert_ledger_consistent,
+    13	    call_service,
+    14	    reset_data,
+    15	    run_concurrently,
+    16	)
+    17	from tests.conftest import (
+    18	    LOPEZ,
+    19	    NAIR,
+    20	    PINECREST,
+    21	    SAMPLE_REQUEST,
+    22	    add_firm,
+    23	    balances,
+    24	    bulk,
+    25	    payment_rows,
+    26	)
+    27	
+    28	ROUNDS = 20
+    29	
+    30	
+    31	def _amount(cents: int) -> str:
+    32	    return f"{cents // 100}.{cents % 100:02d}"
+    33	
+    34	
+    35	@pytest.fixture
+    36	def service_errors(caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixture:
+    37	    """Collects ERROR records of the service: a deadlock is logged there before it becomes busy."""
+    38	    caplog.set_level(logging.ERROR, logger="app.service")
+    39	    return caplog
+    40	
+    41	
+    42	def _error_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    43	    return [r.getMessage() for r in caplog.records if r.name == "app.service"]
+    44	
+    45	
+    46	def _c1_round(db: Session) -> None:
+    47	    reset_data(db)
+    48	    payer = add_firm(db, 10, 100_000)
+    49	    start = balances(db)
+    50	    payload = bulk(payer, (LOPEZ, "100"), (NAIR, "200"))
+    51	
+    52	    outcomes = run_concurrently(lambda _: call_service(payload)[0], 10)
+    53	
+    54	    assert Counter(outcomes) == {"created": 3, "insufficient_funds": 7}
+    55	    assert balances(db)[payer] == 10_000
+    56	    assert len(payment_rows(db)) == 6
+    57	    assert_ledger_consistent(db, start)
+    58	
+    59	
+    60	def test_c1_one_payer_many_batches(db):
+    61	    for _ in range(ROUNDS):
+    62	        _c1_round(db)
+    63	
+    64	
+    65	def test_c2_crossing_payments(db, service_errors):
+    66	    a = add_firm(db, 10, 10_000_000)
+    67	    b = add_firm(db, 11, 10_000_000)
+    68	    start = balances(db)
+    69	    # Interleaved, so both directions start at the barrier side by side.
+    70	    payloads = [bulk(a, (b, "1")), bulk(b, (a, "1"))] * 25
+    71	
+    72	    for _ in range(ROUNDS):
+    73	        outcomes = run_concurrently(lambda i: call_service(payloads[i])[0], len(payloads))
+    74	
+    75	        assert Counter(outcomes) == {"created": 50}, _error_messages(service_errors)
+    76	        current = balances(db)
+    77	        assert (current[a], current[b]) == (10_000_000, 10_000_000)
+    78	        assert_ledger_consistent(db, start)
+    79	    assert _error_messages(service_errors) == []
+    80	
+    81	
+    82	def _c3_batches(firms: list[str]) -> list[dict]:
+    83	    rng = random.Random(20261121)
+    84	    a, b, c = firms[:3]
+    85	    cycle = [bulk(a, (b, "100")), bulk(b, (c, "100")), bulk(c, (a, "100"))]
+    86	    batches = []
+    87	    for index in range(200):
+    88	        if index % 10 < 3:
+    89	            # Three legs of the cycle in every ten batches; with batch i on thread
+    90	            # i % 16, the legs at 0-2 and 10-12 start together at the barrier.
+    91	            batches.append(cycle[index % 10])
+    92	            continue
+    93	        payer = rng.choice(firms)
+    94	        others = [firm for firm in firms if firm != payer]
+    95	        payments = [
+    96	            (rng.choice(others), _amount(rng.randint(1, 20_000))) for _ in range(rng.randint(1, 4))
+    97	        ]
+    98	        batches.append(bulk(payer, *payments))
+    99	    return batches
+   100	
+   101	
+   102	def test_c3_cycle_and_random_mix(db, service_errors):
+   103	    firms = [add_firm(db, 10 + i, 50_000) for i in range(6)]
+   104	    start = balances(db)
+   105	    batches = _c3_batches(firms)
+   106	    threads = 16
+   107	
+   108	    per_thread = run_concurrently(
+   109	        lambda i: [call_service(batch)[0] for batch in batches[i::threads]], threads
+   110	    )
+   111	
+   112	    outcomes = Counter(outcome for results in per_thread for outcome in results)
+   113	    assert sum(outcomes.values()) == 200
+   114	    assert outcomes.keys() <= {"created", "insufficient_funds"}, _error_messages(service_errors)
+   115	    assert outcomes["created"] > 0
+   116	    assert len(payment_rows(db)) > 0
+   117	    assert_ledger_consistent(db, start)
+   118	    assert _error_messages(service_errors) == []
+   119	
+   120	
+   121	def test_c6_hot_payee(db):
+   122	    payers = [add_firm(db, 10 + i, 100_000) for i in range(20)]
+   123	    start = balances(db)
+   124	
+   125	    outcomes = run_concurrently(lambda i: call_service(bulk(payers[i], (NAIR, "10")))[0], 20)
+   126	
+   127	    assert outcomes == ["created"] * 20
+   128	    assert balances(db)[NAIR] == 200_000 + 20 * 1_000
+   129	    assert_ledger_consistent(db, start)
+   130	
+   131	
+   132	def _i5_round(db: Session) -> None:
+   133	    reset_data(db)
+   134	    start = balances(db)
+   135	
+   136	    results = run_concurrently(lambda _: call_service(SAMPLE_REQUEST, key="i5"), 8)
+   137	
+   138	    assert Counter(outcome for outcome, _ in results) == {"created": 1, "replayed": 7}
+   139	    bodies = [body for _, body in results]
+   140	    assert all(body == bodies[0] for body in bodies)
+   141	    assert len(payment_rows(db)) == 3
+   142	    assert balances(db)[PINECREST] == 3_674_875
+   143	    assert db.execute(text("SELECT count(*) FROM idempotency_keys")).scalar_one() == 1
+   144	    assert_ledger_consistent(db, start)
+   145	
+   146	
+   147	def test_i5_same_key_in_parallel(db):
+   148	    for _ in range(10):
+   149	        _i5_round(db)
+=== tests/concurrency/test_multiprocess.py
+     1	"""C7: C1, C2 and I5 over HTTP against the service running as several processes.
+     2	
+     3	The worker processes share no memory; they meet only in the database, as the replicas do.
+     4	"""
+     5	
+     6	import os
+     7	import signal
+     8	import socket
+     9	import subprocess
+    10	import sys
+    11	import time
+    12	from collections import Counter
+    13	from collections.abc import Iterator
+    14	from contextlib import ExitStack, contextmanager
+    15	from pathlib import Path
+    16	
+    17	import httpx2
+    18	import pytest
+    19	
+    20	from app.config import get_settings
+    21	from tests.concurrency.conftest import (
+    22	    SERVICE_ENGINE,
+    23	    assert_ledger_consistent,
+    24	    run_concurrently,
+    25	)
+    26	from tests.conftest import (
+    27	    LOPEZ,
+    28	    NAIR,
+    29	    PINECREST,
+    30	    SAMPLE_REQUEST,
+    31	    add_firm,
+    32	    balances,
+    33	    bulk,
+    34	    payment_rows,
+    35	)
+    36	
+    37	WORKERS = 4
+    38	STARTUP_TIMEOUT_S = 10.0
+    39	STOP_TIMEOUT_S = 10.0
+    40	CLIENT_TIMEOUT_S = 30.0
+    41	CROSSING_ROUNDS = 10
+    42	
+    43	
+    44	def _free_port() -> int:
+    45	    with socket.socket() as sock:
+    46	        sock.bind(("127.0.0.1", 0))
+    47	        return int(sock.getsockname()[1])
+    48	
+    49	
+    50	def _stop(process: subprocess.Popen[bytes]) -> None:
+    51	    """SIGTERM lets Uvicorn stop its workers; SIGKILL to the whole group if it hangs."""
+    52	    if process.poll() is not None:
+    53	        return
+    54	    process.terminate()
+    55	    try:
+    56	        process.wait(timeout=STOP_TIMEOUT_S)
+    57	    except subprocess.TimeoutExpired:
+    58	        os.killpg(process.pid, signal.SIGKILL)
+    59	        process.wait()
+    60	
+    61	
+    62	def _wait_until_ready(process: subprocess.Popen[bytes], base_url: str, log_path: Path) -> None:
+    63	    """Return once /healthz answers 200 and every worker has finished its startup."""
+    64	    deadline = time.monotonic() + STARTUP_TIMEOUT_S
+    65	    while time.monotonic() < deadline:
+    66	        if process.poll() is not None:
+    67	            pytest.fail(f"the server exited with {process.returncode}:\n{log_path.read_text()}")
+    68	        try:
+    69	            response = httpx2.get(f"{base_url}/healthz", timeout=1.0, trust_env=False)
+    70	            healthy = response.status_code == 200
+    71	        except httpx2.TransportError:
+    72	            healthy = False
+    73	        started = log_path.read_text().count("Application startup complete.")
+    74	        if healthy and started == WORKERS:
+    75	            return
+    76	        time.sleep(0.1)
+    77	    pytest.fail(f"the server was not ready within {STARTUP_TIMEOUT_S} s:\n{log_path.read_text()}")
+    78	
+    79	
+    80	@pytest.fixture(scope="module")
+    81	def live_server(_schema: None, tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    82	    """Base URL of `uvicorn --workers 4` serving the test database.
+    83	
+    84	    Connection budget: the in-process test engine (up to 50 connections) is disposed at the
+    85	    end of every module, and again here, so it holds none while these 4 x DB_POOL_SIZE
+    86	    connections may be open; the server is stopped before the next module starts.
+    87	    """
+    88	    SERVICE_ENGINE.dispose()
+    89	    port = _free_port()
+    90	    base_url = f"http://127.0.0.1:{port}"
+    91	    log_path = tmp_path_factory.mktemp("live_server") / "server.log"
+    92	    env = {**os.environ, "DATABASE_URL": get_settings().database_url}
+    93	    command = [sys.executable, "-m", "uvicorn", "app.main:app"]
+    94	    command += ["--host", "127.0.0.1", "--port", str(port), "--workers", str(WORKERS)]
+    95	    # A file, not a pipe: one log record per request would fill a pipe nobody reads.
+    96	    with log_path.open("wb") as log:
+    97	        process = subprocess.Popen(
+    98	            command, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+    99	        )
+   100	        try:
+   101	            _wait_until_ready(process, base_url, log_path)
+   102	            yield base_url
+   103	        finally:
+   104	            _stop(process)
+   105	
+   106	
+   107	@contextmanager
+   108	def http_clients(base_url: str, n: int) -> Iterator[list[httpx2.Client]]:
+   109	    """One client per thread, created before the threads start so they post together."""
+   110	    with ExitStack() as stack:
+   111	        yield [
+   112	            stack.enter_context(
+   113	                httpx2.Client(base_url=base_url, timeout=CLIENT_TIMEOUT_S, trust_env=False)
+   114	            )
+   115	            for _ in range(n)
+   116	        ]
+   117	
+   118	
+   119	def _outcome(response: httpx2.Response) -> tuple[int, str | None]:
+   120	    """The status and, for an error, its code."""
+   121	    if response.status_code == 201:
+   122	        return 201, None
+   123	    return response.status_code, response.json()["error"]["code"]
+   124	
+   125	
+   126	def test_c7_one_payer_over_http(live_server, db):
+   127	    payer = add_firm(db, 10, 100_000)
+   128	    start = balances(db)
+   129	    payload = bulk(payer, (LOPEZ, "100"), (NAIR, "200"))
+   130	
+   131	    with http_clients(live_server, 10) as clients:
+   132	        responses = run_concurrently(
+   133	            lambda i: clients[i].post("/bulk-payments", json=payload), len(clients)
+   134	        )
+   135	
+   136	    outcomes = Counter(_outcome(r) for r in responses)
+   137	    assert outcomes == {(201, None): 3, (422, "insufficient_funds"): 7}
+   138	    assert balances(db)[payer] == 10_000
+   139	    assert len(payment_rows(db)) == 6
+   140	    assert_ledger_consistent(db, start)
+   141	
+   142	
+   143	def test_c7_same_key_over_http(live_server, db):
+   144	    start = balances(db)
+   145	    headers = {"Idempotency-Key": "c7"}
+   146	
+   147	    with http_clients(live_server, 8) as clients:
+   148	        responses = run_concurrently(
+   149	            lambda i: clients[i].post("/bulk-payments", json=SAMPLE_REQUEST, headers=headers),
+   150	            len(clients),
+   151	        )
+   152	
+   153	    assert [r.status_code for r in responses] == [201] * 8
+   154	    replayed = Counter(r.headers.get("Idempotent-Replayed") for r in responses)
+   155	    assert replayed == {None: 1, "true": 7}
+   156	    assert all(r.content == responses[0].content for r in responses)
+   157	    assert len(payment_rows(db)) == 3
+   158	    assert balances(db)[PINECREST] == 3_674_875
+   159	    assert_ledger_consistent(db, start)
+   160	
+   161	
+   162	def test_c7_crossing_over_http(live_server, db):
+   163	    a = add_firm(db, 10, 10_000_000)
+   164	    b = add_firm(db, 11, 10_000_000)
+   165	    start = balances(db)
+   166	    # Interleaved, so both directions start at the barrier side by side.
+   167	    payloads = [bulk(a, (b, "1")), bulk(b, (a, "1"))] * 25
+   168	
+   169	    with http_clients(live_server, len(payloads)) as clients:
+   170	        for _ in range(CROSSING_ROUNDS):
+   171	            responses = run_concurrently(
+   172	                lambda i: clients[i].post("/bulk-payments", json=payloads[i]), len(clients)
+   173	            )
+   174	
+   175	            assert Counter(_outcome(r) for r in responses) == {(201, None): 50}
+   176	            current = balances(db)
+   177	            assert (current[a], current[b]) == (10_000_000, 10_000_000)
+   178	            assert_ledger_consistent(db, start)

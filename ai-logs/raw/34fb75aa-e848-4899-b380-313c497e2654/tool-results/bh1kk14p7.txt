@@ -1,0 +1,628 @@
+     625 triage.diff
+     149 review-report.md
+     774 total
+diff --git a/README.md b/README.md
+index dd96bb1..1c4994b 100644
+--- a/README.md
++++ b/README.md
+@@ -86,7 +86,7 @@ Use `make up`, not a bare `docker compose up`, whenever you bring the stand up a
+ 
+ ### Acceptance walk-through
+ 
+-This continues from [Run it](#run-it).
++This continues from [Run it](#run-it). It covers every step of the acceptance run in spec section 14.2, in a different order, and adds the idempotency demo.
+ 
+ 1. Send the same sample request three more times. Expected: `201`, `201`, then `422`. After three batches Pinecrest has 50,000.00 − 3 × 13,251.25 = 10,246.25, which is less than one batch:
+ 
+@@ -150,7 +150,7 @@ This continues from [Run it](#run-it).
+ 
+    On Podman one of the five requests can take about 2 s while nginx gives up on the stopped replica and passes the request on.
+ 
+-6. Run `make check`. Expected: exit code 0, with 159 tests passing and ruff and mypy clean.
++6. Run `make check`. Expected: exit code 0, with 162 tests passing and ruff and mypy clean.
+ 
+ ### Tests
+ 
+@@ -158,9 +158,9 @@ The tests run against a real PostgreSQL in the stand's `db` container, in a sepa
+ 
+ | Group | Tests | What they show |
+ |---|---|---|
+-| `tests/unit` | 64 | Amount parsing (U1–U3): no float, full match of `[0-9]+(\.[0-9]{1,2})?`, the 32-bit bound. Also the request hash, the request schema, the command builder, and engine construction. |
++| `tests/unit` | 65 | Amount parsing (U1–U3): no float, full match of `[0-9]+(\.[0-9]{1,2})?`, the 32-bit bound. Also the request hash, the request schema, the command builder, and engine construction. |
+ | `tests/db` | 14 | Migrations apply to an empty database and roll back. The schema matches the spec. The app refuses to start when the database is not at the migration head. Payment descriptions never reach error logs. |
+-| `tests/api` | 63 | The HTTP contract. A1–A16 cover both samples from the task, every rejection code, the error format and the payment order. I1–I4 and I6–I9 cover idempotency. |
++| `tests/api` | 65 | The HTTP contract. A1–A16 cover both samples from the task, every rejection code, the error format and the payment order. I1–I4 and I6–I9 cover idempotency. |
+ | `tests/concurrency` | 18 | Races and locks; listed below. |
+ 
+ The concurrency tests do not rely on lucky thread scheduling. Threads start together through a `threading.Barrier`, the race scenarios run for many rounds, and invariants I-1 (no negative balance) and I-2 (the sum of balances is unchanged) are checked after each round. Waits are detected by polling `pg_stat_activity`, not by sleeping.
+@@ -174,7 +174,7 @@ The concurrency tests do not rely on lucky thread scheduling. Threads start toge
+ | C5, C8 | A lock or a key row is held longer than `lock_timeout`: 503 `busy`, nothing changed. |
+ | C6 | Many payers, one payee: the payee's balance equals the start plus all credits. |
+ | C7 | C1, I5 and crossing payments over HTTP against `uvicorn --workers 4`: separate processes that share only the database. |
+-| C9 | No free pool connection: 503 `busy`. |
++| C9 | No free pool connection: 503 `busy`. Tested on the service function; over HTTP a request queues for a thread first (limitation 15). |
+ | I5 | 8 simultaneous requests with one key: one execution, 7 replays with identical bodies (byte-identical over HTTP in C7). |
+ 
+ A statement-order test pins the SQL statements of spec section 8.2, in order.
+@@ -184,10 +184,10 @@ A statement-order test pins the SQL statements of spec section 8.2, in order.
+ | Mutation | Behavioural tests that failed |
+ |---|---|
+ | M1: no `FOR NO KEY UPDATE` | C1, C2, C3, C4, C6 (too many batches accepted, lost updates, the sum of balances changed, a stale balance read) |
+-| M2: no `ORDER BY id` | C3, with real deadlocks, in 3 of 3 runs |
++| M2: no `ORDER BY id` | C3, with real deadlocks: in 3 of 3 runs here and 9 of 10 in the independent review, which also saw one run with every behavioural test green |
+ | M3: payer and payees locked in two queries | C2 and C3, with deadlocks |
+ 
+-Details and log excerpts are in `docs/verification-notes.md`.
++So the behavioural tests catch M2 in most runs, not in all. The statement-order test, which pins the text of the lock query, fails under every mutation; it is the deterministic guard for the `ORDER BY`. Details and log excerpts are in `docs/verification-notes.md`.
+ 
+ ### Static checks
+ 
+@@ -244,13 +244,13 @@ Idempotency-Key: <optional, 1 to 255 visible ASCII characters>
+ 
+ The body is exactly as in the task: `payer_firm_uuid` plus a list of `payments` with `amount`, `payee_firm_uuid` and `description`. The task leaves the path open; `/bulk-payments` is my choice.
+ 
+-The 201 body echoes the payments in request order, with their new ids and normalised amounts. It does not include balances, because the request is not authenticated. `GET /healthz` checks the database connection.
++The 201 body echoes the payments in request order, with their new ids and normalised amounts. It does not include balances, because the request is not authenticated. `GET /healthz` checks the database connection and answers 200 `{"status": "ok"}` or 503 `{"status": "unavailable"}`. It is a probe for nginx and Compose, so it keeps this body instead of the error format below.
+ 
+-All errors share one format: `{"error": {"code": "...", "message": "..."}}`. Validation errors add `details` (`loc`, `msg`, `type`), which never echo the rejected value. The task asks for 422 when a request is denied and does not distinguish reasons. So every rejection caused by the request is a 422, and `code` says why:
++All errors of the API share one format: `{"error": {"code": "...", "message": "..."}}`. Validation errors add `details` (`loc`, `msg`, `type`), which never echo the rejected value. The task asks for 422 when a request is denied and does not distinguish reasons. So every rejection caused by the request is a 422, and `code` says why:
+ 
+ | Status | `code` | When |
+ |---|---|---|
+-| 422 | `validation_error` | The body is not a JSON object, or a field breaks a rule: amount format, UUIDs, a missing `description`, an unknown field, more than 1,000 payments, a description longer than 500 characters, the key format |
++| 422 | `validation_error` | The body is not a JSON object, or a field breaks a rule: amount format, UUIDs, a missing `description`, an unknown field, more than 1,000 payments (checked before the items, so it is one detail), a description longer than 500 characters or with U+0000 or an unpaired surrogate, the key format |
+ | 422 | `self_payment` | A payment from the payer to itself |
+ | 422 | `firm_not_found` | The payer or a payee does not exist |
+ | 422 | `insufficient_funds` | The payer's balance does not cover the batch total |
+@@ -260,6 +260,13 @@ All errors share one format: `{"error": {"code": "...", "message": "..."}}`. Val
+ | 500 | `internal_error` | Anything unexpected; details only in the logs |
+ | 404, 405, other | `not_found`, `method_not_allowed`, `http_error` | Routing errors, in the same format |
+ 
++Also served, beyond the spec's original contract:
++
++- FastAPI's `/docs`, `/redoc` and `/openapi.json`, generated from the code, to try the API in a browser;
++- a 307 redirect from `/bulk-payments/` to `/bulk-payments`.
++
++FastAPI raises a 400 only when it cannot read the body as JSON, so any 400 becomes a 422 `validation_error`.
++
+ ## Solution and approach
+ 
+ ### Data model
+@@ -296,7 +303,7 @@ Any rejection rolls back everything, including the key row.
+ 
+ **Why one query, ordered by `id`.** Crossing payments (A pays B while B pays A) would deadlock if each transaction locked its own payer first. Every transaction takes all its locks in one query in the same global order, so no wait cycle can form; PostgreSQL's documentation recommends exactly this protection against deadlocks. A design probe on PostgreSQL 16 gave 0 deadlocks in 2,400 crossing transactions with `ORDER BY` and 80 without it.
+ 
+-In this project on PostgreSQL 18.6, the two-firm crossing test did *not* deadlock without `ORDER BY`. The three-firm cycle test did, in every run. So the claim rests on C3 and on mutations M2 and M3, not on the two-firm case. Why the two-firm case stays clean here is not established; the notes list the candidate explanations.
++In this project on PostgreSQL 18.6, without `ORDER BY`, the in-process two-firm crossing test (C2) never deadlocked. The three-firm cycle test (C3) deadlocked in 12 of 13 runs. The independent review saw the two-firm crossing over HTTP (C7, four processes) deadlock in 3 of 10 runs. So the claim rests on C3, C7 and mutations M2 and M3, not on C2. The behavioural tests catch a missing `ORDER BY` in most runs, not in all; the statement-order test catches it every time. Why C2 stays clean is not established; the notes list the candidate explanations.
+ 
+ **Why `FOR NO KEY UPDATE`, not `FOR UPDATE`.** The balance is not a key column, and a plain `UPDATE` of it takes this same lock mode. `FOR UPDATE` would also block the foreign-key check (`FOR KEY SHARE`) of another transaction inserting a payment that references the same firm. `FOR NO KEY UPDATE` does not.
+ 
+@@ -316,7 +323,7 @@ The task's tables use `INTEGER`, so every amount, batch total and balance must f
+ 
+ The endpoint is a plain `def`, and the database access is synchronous SQLAlchemy 2.1 with psycopg 3. There are no external calls, so request time is database time, and the connection pool bounds concurrency in any case. Async would add complexity with no gain.
+ 
+-FastAPI runs sync endpoints in AnyIO's thread pool, which allows 40 threads by default. At startup the app sets that limit to the pool size (10), so a request waits for a thread instead of failing at pool checkout. The pool has no overflow and checks each connection before handing it out. The connection budget is 3 replicas × 10 = 30 connections, against PostgreSQL's default of 100.
++FastAPI runs sync endpoints in AnyIO's thread pool, which allows 40 threads by default. At startup the app sets that limit to the pool size (10), so a request waits for a thread instead of failing at pool checkout. The independent review found the cost: that wait has no time limit (limitation 15). The pool has no overflow and checks each connection before handing it out. The connection budget is 3 replicas × 10 = 30 connections, against PostgreSQL's default of 100.
+ 
+ ### Idempotency-Key: a feature beyond the task
+ 
+@@ -388,6 +395,7 @@ Each bulk payment request produces one structured JSON log record with:
+ - the number of payments;
+ - the total;
+ - the outcome: `created`, `replayed` or the rejection code;
++- the HTTP status;
+ - the duration.
+ 
+ Payment descriptions are never logged. The engine runs with `hide_parameters=True`, so not even a database error's traceback carries them, and a test checks this.
+@@ -417,9 +425,14 @@ Payment descriptions are never logged. The engine runs with `hide_parameters=Tru
+ - **Stale balancer.** After the replicas were recreated, nginx still pointed at the old addresses and returned 504. `make up` now restarts it.
+ - **The 1 MB body limit.** nginx's default rejected a valid 1,000-payment batch with an HTML 413, so the balancer's limit is now 8 MB.
+ - **`curl -d` without `Content-Type`.** This got a 422 whose message did not say why. It now says to send JSON with `Content-Type: application/json`.
+-- **The 80 deadlocks did not reproduce.** The design probe's two-firm result did not repeat on PostgreSQL 18.6 (see the core section). The first write-up of this in the notes guessed a cause from a query plan it had not captured; the published notes give the captured plans and say the cause is not established.
++- **The 80 deadlocks did not reproduce in-process.** The design probe's two-firm result did not repeat in the in-process test on PostgreSQL 18.6; over HTTP, the independent review later saw two-firm deadlocks (see the core section). The first write-up of this in the notes guessed a cause from a query plan it had not captured; the published notes give the captured plans and say the cause is not established.
+ - **Podman.** A stopped replica's address timed out instead of refusing the connection, so nginx waited 2 s (`proxy_connect_timeout`) before moving on.
+ 
++**After the independent review:**
++
++- **A 9 MB answer to a bad batch.** The 1,000-payment limit was checked after Pydantic had validated every item, so 60,000 invalid items got a 422 with one detail per item. The limit is now checked first, and the answer has one detail.
++- **Claims the review disproved.** The notes said M2 failed C3 in 3 of 3 runs and that the two-firm case did not deadlock without `ORDER BY`. The review's ten runs say otherwise (see the mutation check and the core section). Spec section 17 also claimed that the tests re-confirm every design probe; it now says which ones they do.
++
+ ## Assumptions
+ 
+ The task does not specify these; `docs/spec.md` section 4 has the reasoning for each.
+@@ -452,7 +465,12 @@ The task does not specify these; `docs/spec.md` section 4 has the reasoning for
+ 12. More than 1,000 payments must be split into several requests, which are atomic one by one, not together.
+ 13. `lock_timeout` bounds each lock wait, not the whole request. A request that waits on several rows in turn could run past nginx's 60 s read timeout and get an HTML 504 while its transaction still commits. Improvement: a request deadline, or a transaction-scoped `statement_timeout`.
+ 14. A body over 8 MB gets nginx's own 413 page instead of the JSON error format.
+-15. All performance figures come from one machine. They are measurements, not capacity guarantees.
++15. **Waiting for a thread has no time limit.** The thread limit equals the pool size, so a request beyond it queues for a thread with no timeout. Its `lock_timeout` starts only once it has a thread. With the defaults, the "no free pool connection → 503" branch is not reached over HTTP. The independent review measured this. With one firm row held for 14 s, 45 parallel requests to that firm got 503 after 5 to 10 s, and two got 201 after 13 s. Under saturation longer than 60 s, nginx would answer 504 while the request may still run. Possible remedies:
++    - run the service call through a dedicated `anyio.CapacityLimiter` the size of the pool, acquired under `anyio.fail_after(DB_POOL_TIMEOUT_S)`, and answer 503 `busy` on timeout;
++    - raise the thread limit above the pool size, so that extra threads wait in pool checkout and get 503 after `DB_POOL_TIMEOUT_S`. This leaves the queue beyond the new limit unbounded;
++    - shed load before the thread pool: a middleware that answers 503 above a number of requests in flight, or nginx `max_conns` with a short queue per replica;
++    - an `async` endpoint with an async driver, which removes the thread pool and leaves the pool's `pool_timeout` as the bound.
++16. All performance figures come from one machine. They are measurements, not capacity guarantees.
+ 
+ ## How I worked
+ 
+@@ -470,6 +488,7 @@ I used Claude models throughout. The implementation, the reviews and this README
+ | Whole-branch review | Claude Fable 5.2 | Three important findings and two minor ones, fixed in one wave by an Opus subagent and confirmed by a Sonnet re-review |
+ | Typing and docstrings, schema check at startup | Claude Opus 5.5 subagent, at my request | |
+ | This README | Claude Opus 5.5, at my request | Drafted from the spec, the verification notes, the code and my outline, then fact-checked against the repository by a separate Opus subagent |
++| Independent review | Claude Fable 5.2, a new session with only the repository | Nine findings and the acceptance run of spec section 14.2 on a clean clone; triaged below |
+ 
+ The implementation ran under the `subagent-driven-development` skill from the superpowers plugin:
+ 
+@@ -513,7 +532,22 @@ These were my own requests:
+ - moving `make test`, `lint` and `load` to uv on the host;
+ - the schema check at startup;
+ - full typing and docstrings;
+-- the README draft.
++- the README draft;
++- how to settle each finding of the independent review.
++
++**Independent review.** A new Fable 5.2 session saw only a clean clone of the branch and ran the review prompt of `docs/agent-workflow.md`, step 5. It found no interleaving that breaks an invariant. Its acceptance run on Podman matched every expected value of spec section 14.2. It also stopped the database: POST answered 500 `internal_error`, and the replicas recovered on their own once it was back. It did not run the load test. I triaged its nine findings:
++
++| # | Finding | Outcome |
++|---|---|---|
++| 1 | `ai-logs/` was empty | The session logs go there before submission |
++| 2 | A clone gets `main`, which held only the docs | Resolved once the pull request is merged |
++| 3 | M2 is caught by behavioural tests in most runs, not in all, and the two-firm case does deadlock over HTTP | Docs corrected; the statement-order test remains the deterministic guard |
++| 4 | The wait for a thread has no time limit | Documented with remedies (limitation 15) |
++| 5 | `/healthz` answers 503 outside the error format, untested | Kept as a probe body, excluded from A12 in the spec, test added |
++| 6 | The batch limit was checked after validating every item | Fixed, with tests |
++| 7 | Spec section 17 claimed every probe result is re-tested | Each probe result now says how, or whether, it was re-confirmed |
++| 8 | `/docs`, `/redoc`, `/openapi.json`, the 307 redirect, the surrogate rule and the log's `status` field were not in the spec | Kept and added to the spec and this README |
++| 9 | The walk-through's order differs from spec 14.2 | Noted at the top of the walk-through |
+ 
+ `docs/plan.md` (Execution Record) lists what changed against the plan.
+ 
+diff --git a/app/schemas.py b/app/schemas.py
+index ad09056..53ea78c 100644
+--- a/app/schemas.py
++++ b/app/schemas.py
+@@ -2,7 +2,10 @@ import re
+ from typing import Annotated, TypedDict
+ from uuid import UUID
+ 
+-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictStr
++from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictStr, field_validator
++from pydantic_core import PydanticCustomError
++
++from app.config import get_settings
+ 
+ INT32_MAX = 2_147_483_647
+ 
+@@ -61,13 +64,29 @@ class PaymentIn(BaseModel):
+ 
+ 
+ class BulkPaymentRequest(BaseModel):
+-    """The request body; limits that depend on settings are checked in build_command."""
++    """The request body; the description length limit is checked in build_command."""
+ 
+     model_config = ConfigDict(extra="forbid")
+ 
+     payer_firm_uuid: UUID
+     payments: Annotated[list[PaymentIn], Field(min_length=1)]
+ 
++    @field_validator("payments", mode="before")
++    @classmethod
++    def _check_payment_count(cls, value: object) -> object:
++        """Reject a batch over MAX_PAYMENTS_PER_REQUEST before any of its items is validated.
++
++        An oversized batch then costs one error entry, not one entry per invalid item.
++        """
++        limit = get_settings().max_payments_per_request
++        if isinstance(value, list) and len(value) > limit:
++            raise PydanticCustomError(
++                "too_long",
++                "at most {limit} payments are allowed per request",
++                {"limit": limit},
++            )
++        return value
++
+ 
+ class PaymentOut(TypedDict):
+     """One payment of the 201 body, in request order."""
+diff --git a/app/service.py b/app/service.py
+index 2e783b8..489ca3c 100644
+--- a/app/service.py
++++ b/app/service.py
+@@ -74,11 +74,6 @@ def build_command(
+ 
+     Pure: no database access. Raises ValidationFailed or SelfPayment.
+     """
+-    max_payments = settings.max_payments_per_request
+-    if len(request.payments) > max_payments:
+-        msg = f"at most {max_payments} payments are allowed per request"
+-        raise ValidationFailed(msg, [_detail(["body", "payments"], msg, "too_long")])
+-
+     max_length = settings.max_description_length
+     msg = f"description must be at most {max_length} characters long"
+     too_long = [
+diff --git a/docs/plan.md b/docs/plan.md
+index b710b81..1acef3c 100644
+--- a/docs/plan.md
++++ b/docs/plan.md
+@@ -46,7 +46,15 @@ Tasks 1–8 and the whole-branch review ran on 2026-11-24 on branch `feat/bulk-p
+ - `make test`, `make lint` and `make load` run on the host through `uv run` (the author's decision). Task 1 originally ran them in a one-off `app` container. The recorded load runs used the in-container command.
+ - Function and method signatures in `app/`, `scripts/` and `migrations/` are fully typed under mypy strict, and ruff requires docstrings on them. The largest test helpers and tests have them as well.
+ - At the author's request, each replica checks at startup that `alembic_version` equals the migration head and exits otherwise (`app/schema_revision.py`, commit 90940af).
+-- The README was drafted in the controller session at the author's request; the independent review (Task 9, Step 1) is still to run.
++- The README was drafted in the controller session at the author's request.
++- The independent review (Task 9, Step 1) ran on 2026-11-24 in a new Fable 5.2 session on a clean clone at 8c1107e. Its acceptance run passed, and it found no interleaving that breaks an invariant. The author settled its nine findings, and the controller applied them:
++  - the batch limit is checked before the items are validated (commit 7c84a37);
++  - a test covers the 503 from `/healthz` (b3860a3);
++  - the docs were corrected where the review disproved them: the M2 results, the two-firm case, and which probe results the tests re-confirm;
++  - the unbounded wait for a thread is documented with remedies;
++  - `/healthz`, `/docs`, `/redoc`, `/openapi.json`, the 307 redirect, the surrogate rule and the log's `status` field are added to the spec.
++
++  The README lists each finding and its outcome. The test count is now 162.
+ 
+ ## Review Focus
+ 
+diff --git a/docs/spec.md b/docs/spec.md
+index 795bdda..7184e23 100644
+--- a/docs/spec.md
++++ b/docs/spec.md
+@@ -1,7 +1,7 @@
+ # Firm Payments: Bulk Payment Service Specification
+ 
+ - Date: 2026-11-21
+-- Status: approved; revision 5 (2026-11-24). Revision 2 folded in the rules found while planning and the probe results of section 17. Revision 3 adds the run stand (section 5.6) and the justified batch limit (section 5.7). Revision 4 follows a validation against the task statement: the second request from the task (page 3) becomes a sample, the rationale for the service table is restated, the Python version is pinned, and the local container runtime is recorded. Revision 5 records what the implementation and its checks found: the observed mutation results (sections 5.4, 8.3, 13.7), the measured batch limit (5.7), the stand checks on Podman and Docker Engine (13.8, 17), configurable host ports and the balancer's body limit (5.6), the routing error codes (8.1) and the per-wait meaning of `lock_timeout` (9.3, 15). Measured results are in `docs/verification-notes.md`
++- Status: approved; revision 6 (2026-11-25). Revision 2 folded in the rules found while planning and the probe results of section 17. Revision 3 adds the run stand (section 5.6) and the justified batch limit (section 5.7). Revision 4 follows a validation against the task statement: the second request from the task (page 3) becomes a sample, the rationale for the service table is restated, the Python version is pinned, and the local container runtime is recorded. Revision 5 records what the implementation and its checks found: the observed mutation results (sections 5.4, 8.3, 13.7), the measured batch limit (5.7), the stand checks on Podman and Docker Engine (13.8, 17), configurable host ports and the balancer's body limit (5.6), the routing error codes (8.1) and the per-wait meaning of `lock_timeout` (9.3, 15). Revision 6 follows the independent review (agent workflow step 5): the mutation M2 results and the two-firm case (5.4, 8.3, 13.7), the count check before the elements, the surrogate rule and what lies outside the error format (8.1), the unbounded wait for a thread (8.2, 9.3, 13.5, 15), the HTTP status in the log entry (12), and which probe results the project re-confirmed (17). Measured results are in `docs/verification-notes.md`
+ - Location in repository: `docs/spec.md`
+ - Basis: TaxDome technical challenge "Firm Payments: Build a bulk payment service" (PDF, 5 pages)
+ 
+@@ -116,7 +116,7 @@ Guarantee: each key corresponds to at most one execution.
+ | In-memory process locks | Rejected: they do not work across instances |
+ | Balance as a sum over a journal | Rejected: contradicts the `balance_cents` column |
+ 
+-Rationale [R]: default isolation level, no retries, the check is readable in code and deterministically testable. A single acquisition order is the protection against deadlocks recommended by PostgreSQL documentation. A probe confirmed the choice (section 17): 2,400 crossing transactions with the ordered query produced no deadlocks, and the same run without `ORDER BY` produced 80. In the project (PostgreSQL 18.6) the two-firm crossing test C2 did not deadlock without `ORDER BY`; the three-firm cycle test C3 did, in every run (section 13.7). Cost: payee rows are locked for the whole transaction; the transaction is short, and this is accepted (section 9.3).
++Rationale [R]: default isolation level, no retries, the check is readable in code and deterministically testable. A single acquisition order is the protection against deadlocks recommended by PostgreSQL documentation. A probe confirmed the choice (section 17): 2,400 crossing transactions with the ordered query produced no deadlocks, and the same run without `ORDER BY` produced 80. In the project (PostgreSQL 18.6), without `ORDER BY` the three-firm cycle test C3 deadlocked in 12 of 13 runs and the two-firm crossing over HTTP (C7, four processes) in 3 of 10, while the in-process two-firm test C2 never did (section 13.7). Cost: payee rows are locked for the whole transaction; the transaction is short, and this is accepted (section 9.3).
+ 
+ ### 5.5. Synchronous or asynchronous database access
+ 
+@@ -276,10 +276,10 @@ The body is as in the task.
+ |---|---|
+ | Body | An object; unknown fields are forbidden [P] |
+ | `payer_firm_uuid` | A valid UUID in any form Pydantic accepts (hyphenated, bare hex, in braces), normalized to canonical lowercase |
+-| `payments` | An array of 1 to `MAX_PAYMENTS_PER_REQUEST` elements (default 1000 [R], section 5.7) |
++| `payments` | An array of 1 to `MAX_PAYMENTS_PER_REQUEST` elements (default 1000 [R], section 5.7). The length is checked before the elements, so an oversized array gets one `too_long` detail however many elements are invalid |
+ | `amount` | Strictly a JSON string of at most 11 characters, full match of `[0-9]+(\.[0-9]{1,2})?`, value greater than zero, at most 2,147,483,647 cents |
+ | `payee_firm_uuid` | A valid UUID, normalized the same way, not equal to the payer |
+-| `description` | A string, required, no longer than `MAX_DESCRIPTION_LENGTH` (default 500 [P]), must not contain the character U+0000 |
++| `description` | A string, required, no longer than `MAX_DESCRIPTION_LENGTH` (default 500 [P]), must not contain the character U+0000 or an unpaired surrogate (from a JSON escape such as `\ud800`) |
+ | `Idempotency-Key` | 1 to 255 characters in the range 0x21–0x7E (visible ASCII, no spaces) [P]. If the header is sent more than once, the first value is used |
+ | Batch total | At most 2,147,483,647 cents |
+ 
+@@ -291,7 +291,7 @@ Amount-parsing details that are easy to miss:
+ - Conversion to cents is integer arithmetic, via `Decimal` or by splitting the string. `float` is not used anywhere.
+ - A string longer than 11 characters is rejected before any numeric conversion: 8 integer digits, a point and 2 decimals is the longest value that fits the bound.
+ 
+-`description` rejects U+0000 because PostgreSQL `TEXT` cannot store it. Without the rule such a request would end in a 500 (confirmed, section 17).
++`description` rejects U+0000 because PostgreSQL `TEXT` cannot store it. Without the rule such a request would end in a 500 (confirmed, section 17). An unpaired surrogate cannot be encoded as UTF-8, neither for the request hash nor for the database.
+ 
+ **201 response**
+ 
+@@ -334,7 +334,13 @@ A single format:
+ | 405 | `method_not_allowed` | Known path, wrong method |
+ | other 4xx | `http_error` | Any other HTTP-level error raised by the framework |
+ 
+-A body that is not valid UTF-8 is a `validation_error` too, not a 400. When the body is rejected and the request's `Content-Type` is not JSON (curl's `-d` sends `application/x-www-form-urlencoded`), the message says to send `Content-Type: application/json`. `details` carry only `loc`, `msg` and `type`, never the rejected input. A body over the balancer's 8 MB limit is refused by nginx with its own 413 page before it reaches the service.
++A body that is not valid UTF-8 is a `validation_error` too, not a 400: FastAPI raises 400 only when it cannot read the body as JSON, so every framework 400 is answered as 422 `validation_error`. When the body is rejected and the request's `Content-Type` is not JSON (curl's `-d` sends `application/x-www-form-urlencoded`), the message says to send `Content-Type: application/json`. `details` carry only `loc`, `msg` and `type`, never the rejected input. A body over the balancer's 8 MB limit is refused by nginx with its own 413 page before it reaches the service.
++
++Outside the format [P]:
++
++- `GET /healthz` answers 200 `{"status": "ok"}`, or 503 `{"status": "unavailable"}` when the database does not answer. It is a probe for the balancer and Compose, not part of the API, so A12 does not apply to it.
++- `POST /bulk-payments/` with a trailing slash gets the framework's 307 redirect to `/bulk-payments`; it is not logged as a bulk payment request.
++- FastAPI's generated `/docs`, `/redoc` and `/openapi.json` are served. They describe the same endpoint, generated from the code and its docstrings, and let a reader try the API in a browser.
+ 
+ Rationale [P]: the task requires 422 for a rejected request and does not distinguish reasons, so all rejections caused by the request return 422, and the reason is carried in `code`. FastAPI's default validation error handler is overridden so that the format is uniform. For a key reused with different content, 422 matches the recommendation of the IETF draft.
+ 
+@@ -377,7 +383,7 @@ Any rejection in steps 2–6 rolls back the whole transaction, including the key
+ | Situation | Action |
+ |---|---|
+ | Lock wait timed out (SQLSTATE 55P03) | Roll back, 503 `busy` |
+-| No free connection in the pool | 503 `busy` |
++| No free connection in the pool | 503 `busy`. With the defaults this branch is not reached over HTTP: the thread limit equals the pool size, so a request waits for a thread instead (section 9.3) |
+ | Deadlock (SQLSTATE 40P01) | Roll back, 503 `busy`, log at ERROR level: by construction this should not occur |
+ | Other | Roll back, 500 `internal_error` |
+ 
+@@ -391,7 +397,7 @@ Any rejection in steps 2–6 rolls back the whole transaction, including the key
+ 
+ **Why the balance check is in code rather than in `WHERE`.** The row is locked, the value is current, the condition is in one place, and it distinguishes the reasons for rejection.
+ 
+-**Why the lock order is specifically by `id`.** `id` is immutable, so the order is the same for all transactions at any time. The documentation does not state outright that `ORDER BY ... FOR NO KEY UPDATE` acquires locks in sorted order. A probe supports it (section 17): the query plan puts the `LockRows` node above `Sort`, so rows are locked as they leave the sort, and the same workload without `ORDER BY` deadlocks. In the project the plan has the same shape on PostgreSQL 18.6, and without `ORDER BY` the cycle test C3 deadlocks while the two-firm crossing test C2 does not (section 13.7); why C2 stays clean is not established.
++**Why the lock order is specifically by `id`.** `id` is immutable, so the order is the same for all transactions at any time. The documentation does not state outright that `ORDER BY ... FOR NO KEY UPDATE` acquires locks in sorted order. A probe supports it (section 17): the query plan puts the `LockRows` node above `Sort`, so rows are locked as they leave the sort, and the same workload without `ORDER BY` deadlocks. In the project the plan has the same shape on PostgreSQL 18.6. Without `ORDER BY`, the cycle test C3 deadlocks in most runs and the two-firm crossing over HTTP (C7) in some, while the in-process two-firm test C2 never does (section 13.7); why C2 stays clean is not established.
+ 
+ ## 9. Concurrency and invariants
+ 
+@@ -423,6 +429,7 @@ Any rejection in steps 2–6 rolls back the whole transaction, including the key
+ - Hold time equals the transaction duration, so the transaction contains nothing except four to five database queries: parsing and checks are moved outside, and payments are inserted in one operation.
+ - Batch size is bounded so that one request does not hold locks on thousands of firms for long. The bound and its measurement are in section 5.7.
+ - Each lock wait is bounded by `lock_timeout`: when it is exhausted, the client receives 503, not an indefinite wait. The bound applies to each wait, not to the request: a request that waits on several rows in turn can wait up to `lock_timeout` for each of them. nginx gives up on a response after 60 s (`proxy_read_timeout`) and returns its own 504 page, while the transaction may still commit.
++- Waiting for a thread has no bound. The thread limit equals the pool size (section 10), so a request beyond it queues for a thread with no timeout and starts its `lock_timeout` only once it has one. The independent review measured it: with one firm row held for 14 s, 45 parallel requests to that firm got 503 after 5.0 to 10.0 s, and two got 201 after 13.06 s; `/healthz` once took 2.97 s. Under saturation longer than nginx's 60 s, the client gets 504 while its request may still run. Remedies are in section 15, item 15.
+ - The real limit is connections: a waiting transaction occupies a connection. Pool size multiplied by the number of instances must not exceed the database's connection limit. On the stand this is 3 × 10 = 30 of PostgreSQL's default 100.
+ 
+ ## 10. Configuration
+@@ -488,7 +495,7 @@ Boundary of responsibility: `api.py` does not know about SQL, `service.py` does
+ 
+ ## 12. Observability
+ 
+-- A structured log entry per request: request identifier, payer, number of payments, total, outcome (`created`, `replayed`, rejection code), duration. The request identifier comes from the `X-Request-Id` header set by the balancer, or is generated if the header is absent. The entry also names the instance (the container host name), so a request can be followed across replicas.
++- A structured log entry per request: request identifier, payer, number of payments, total, outcome (`created`, `replayed`, rejection code), HTTP status, duration. The request identifier comes from the `X-Request-Id` header set by the balancer, or is generated if the header is absent. The entry also names the instance (the container host name), so a request can be followed across replicas.
+ - `GET /healthz`: database connection check.
+ - Payment descriptions are not written to logs.
+ 
+@@ -530,7 +537,7 @@ The verification question: is the service built according to this specification?
+ | A9 | Empty list, limit exceeded, extra field, long description, description with U+0000 | 422 `validation_error` |
+ | A10 | UUID in uppercase | 201 |
+ | A11 | Payee balance overflow | 422 `balance_overflow`; nothing changed |
+-| A12 | Error format | All 4xx and 5xx responses use the single format |
++| A12 | Error format | All 4xx and 5xx responses use the single format, except `/healthz` and the nginx 413 page (section 8.1) |
+ | A13 | Payment order in response | Matches request order |
+ | A14 | Body that is not a JSON object: invalid JSON, `[]`, `"x"`, `null`, `123`, an empty body, JSON sent as `text/plain` | 422 `validation_error` |
+ | A15 | Body of a successful response | Contains no balance |
+@@ -562,7 +569,7 @@ The verification question: is the service built according to this specification?
+ | C6 | Many payers, one payee | Payee balance equals the start plus the sum of all credits |
+ | C7 | C1, C2 and I5 over HTTP against the service running as several processes | Results as in C1, C2 and I5 |
+ | C8 | Another transaction holds an uncommitted row for the same key longer than `LOCK_TIMEOUT_MS` | 503 `busy`; nothing changed |
+-| C9 | No free connection in the pool within `DB_POOL_TIMEOUT_S` | 503 `busy` |
++| C9 | No free connection in the pool within `DB_POOL_TIMEOUT_S` | 503 `busy`; tested on the service function with its own engine, since over HTTP the thread limit queues the request first (section 9.3) |
+ | L1 | `scripts/load.py` through the balancer: uniform load, "hot" payer, "hot" payee, maximal batch (1,000 payments to 1,000 distinct payees) | Report: requests per second, p50/p95/p99; for the maximal batch, its duration against the 250 ms budget of section 5.7. After the run, I-1 and I-2 hold and there are no 500 responses |
+ 
+ Scenario C7 models multiple instances: Uvicorn processes do not share memory and communicate only through the database. It includes crossing payments because the lock order must hold across processes, not only within one. C7 runs inside the test suite, with processes; the real replicas behind the balancer are exercised by L1 and by checks S1–S3 (section 13.8). There are no pass/fail thresholds for L1: the goal is to replace the calculated estimate from assumption 7 with a measurement and record the result in the README.
+@@ -584,7 +591,7 @@ Each mutation is applied to the service code alone, the concurrency tests are ru
+ | M2 | Remove `ORDER BY` from the lock query | C2 or C3 fails with deadlocks |
+ | M3 | Lock the payer in one query and the payees in a second | C2 fails with deadlocks |
+ 
+-A mutation that leaves every test green means the tests are too weak and must be strengthened. The observed results are recorded in `docs/verification-notes.md`: M1 failed C1, C2, C3, C4 and C6; M2 failed C3 in 3 of 3 runs while C2 stayed green; M3 failed C2 and C3. No test needed strengthening.
++A mutation that leaves every test green means the tests are too weak and must be strengthened. The observed results are recorded in `docs/verification-notes.md`: M1 failed C1, C2, C3, C4 and C6; M2 failed C3 in 3 of 3 runs while C2 stayed green; M3 failed C2 and C3. The independent review repeated M2 ten times: C3 failed in 9 runs, C7's two-firm crossing over HTTP in 3, C2 in none, and in one run every behavioral test stayed green. Catching M2 therefore depends on scheduling. The deterministic guard is the statement-order test, which pins the text of the lock query and fails under every mutation; it is a structural check, not a behavioral one. No test was strengthened.
+ 
+ ### 13.8. Checks of the run stand
+ 
+@@ -667,6 +674,11 @@ Step 6 checks understanding of the task on the task's own data: the balance afte
+ 12. A client with more than 1,000 payments must split them into several requests; atomicity then holds per request, not across them.
+ 13. `lock_timeout` bounds each lock wait, not the whole request (section 9.3). Improvement: a transaction-scoped `statement_timeout` or a request deadline below the balancer's read timeout.
+ 14. A body over 8 MB gets nginx's own 413 page instead of the single error format. Improvement: an nginx `error_page` that returns the JSON format.
++15. Waiting for a worker thread has no bound (section 9.3), so the pool row of section 8.2 is not reached over HTTP with the defaults. Possible remedies:
++    - run the service call through a dedicated `anyio.CapacityLimiter` the size of the pool, acquired under `anyio.fail_after(DB_POOL_TIMEOUT_S)`, and answer 503 `busy` when the timeout expires;
++    - raise the thread limit above the pool size, so that extra threads wait in pool checkout and get 503 `busy` after `DB_POOL_TIMEOUT_S`, which leaves the queue beyond the new limit unbounded;
++    - shed load before the thread pool: a middleware that counts requests in flight and answers 503 over a threshold, or nginx `max_conns` with a short queue per upstream server;
++    - make the endpoint `async` with an async driver, which removes the thread pool and leaves the pool's own `pool_timeout` as the bound.
+ 
+ ## 16. Left to the implementer
+ 
+@@ -694,29 +706,29 @@ Checked against primary sources during design (21–24.11.2026):
+ - PostgreSQL, Connections and Authentication: `max_connections` is typically 100 by default: https://www.postgresql.org/docs/current/runtime-config-connection.html
+ - PostgreSQL 19 release announcement of 2026-11-19: https://www.postgresql.org/about/news/postgresql-19-released-3449/
+ 
+-Confirmed by throwaway probes on 2026-11-21 and 2026-11-24 (PostgreSQL 16.15, psycopg 3.3.9, SQLAlchemy 2.1.9, FastAPI 0.165.0, Pydantic 2.13.5, AnyIO 4.15.1). The probes are not part of the repository; the project's tests re-confirm each point on the pinned versions.
+-
+-- `SET LOCAL lock_timeout` with a bound parameter fails with a syntax error. `set_config('lock_timeout', ..., true)` works and resets at commit.
+-- `INSERT ... ON CONFLICT DO NOTHING` waits for an uncommitted conflicting row. If that transaction commits, the insert returns no row and the next statement sees the committed row. If it rolls back, the insert succeeds.
+-- `lock_timeout` bounds both that wait and a row-lock wait. The error is SQLSTATE 55P03; SQLAlchemy raises it as `OperationalError` with `orig.sqlstate` set.
+-- The plan of the lock query is `LockRows` above `Sort`. 2,400 crossing transactions with `ORDER BY id` gave 0 deadlocks; the same run without `ORDER BY` gave 80. The project did not reproduce the 80 with two firms on PostgreSQL 18.6; it reproduced deadlocks without `ORDER BY` with three firms (section 13.7).
+-- Locking the payer and the payee in separate queries deadlocks under a forced interleaving (SQLSTATE 40P01).
+-- After waiting for a row lock, the lock query returns the value committed by the other transaction.
+-- A firm row held `FOR NO KEY UPDATE` does not block an insert into `payments` that references it. Held `FOR UPDATE`, it does.
+-- PostgreSQL rejects U+0000 in `TEXT`. Through SQLAlchemy this is a `DataError`, which would surface as a 500 without the validation rule.
+-- `JSONB` reorders object keys; `JSON` returns the stored text unchanged.
+-- Pool exhaustion raises `sqlalchemy.exc.TimeoutError`, which is not a `DBAPIError`.
+-- `add_all` followed by `flush` assigns ids in list order (checked for 1,000 rows).
+-- FastAPI answers 422 to invalid JSON, to a body that is not an object, to an empty body and to JSON sent as `text/plain`.
+-- AnyIO's default thread limit is 40. It can be changed in the lifespan handler but not from a worker thread.
+-- One transaction of 1,000 payments to 1,000 distinct payees held its locks for 109 ms (median of 7 runs; table in section 5.7).
++Confirmed by throwaway probes on 2026-11-21 and 2026-11-24 (PostgreSQL 16.15, psycopg 3.3.9, SQLAlchemy 2.1.9, FastAPI 0.165.0, Pydantic 2.13.5, AnyIO 4.15.1). The probes are not part of the repository. Each point says whether the project re-confirmed it on the pinned versions, and how.
++
++- `SET LOCAL lock_timeout` with a bound parameter fails with a syntax error. `set_config('lock_timeout', ..., true)` works and resets at commit. *The syntax error rests on the probe; `set_config` is exercised by C5 and C8.*
++- `INSERT ... ON CONFLICT DO NOTHING` waits for an uncommitted conflicting row. If that transaction commits, the insert returns no row and the next statement sees the committed row. If it rolls back, the insert succeeds. *Re-confirmed: I5 and the key-wait tests.*
++- `lock_timeout` bounds both that wait and a row-lock wait. The error is SQLSTATE 55P03; SQLAlchemy raises it as `OperationalError` with `orig.sqlstate` set. *Re-confirmed: C5, C8.*
++- The plan of the lock query is `LockRows` above `Sort`. 2,400 crossing transactions with `ORDER BY id` gave 0 deadlocks; the same run without `ORDER BY` gave 80. *The plan shape was re-observed on PostgreSQL 18.6 with `auto_explain` (`docs/verification-notes.md`). The counts were not reproduced: without `ORDER BY`, the in-process two-firm test C2 never deadlocked, while the three-firm cycle C3 and the two-firm crossing over HTTP (C7) did in most and in some runs (section 13.7).*
++- Locking the payer and the payee in separate queries deadlocks under a forced interleaving (SQLSTATE 40P01). *Re-confirmed by mutation M3 (section 13.7), not by a test in the suite.*
++- After waiting for a row lock, the lock query returns the value committed by the other transaction. *Re-confirmed: C4.*
++- A firm row held `FOR NO KEY UPDATE` does not block an insert into `payments` that references it. Held `FOR UPDATE`, it does. *Probe only; the suite pins the locking clause through the text of the lock query (statement-order test).*
++- PostgreSQL rejects U+0000 in `TEXT`. Through SQLAlchemy this is a `DataError`, which would surface as a 500 without the validation rule. *The validation rule is tested (A9); the `DataError` rests on the probe.*
++- `JSONB` reorders object keys; `JSON` returns the stored text unchanged. *The `JSON` half is covered by the byte-identical replay tests (I1, I8); the `JSONB` half rests on the probe.*
++- Pool exhaustion raises `sqlalchemy.exc.TimeoutError`, which is not a `DBAPIError`. *Re-confirmed: C9.*
++- `add_all` followed by `flush` assigns ids in list order (checked for 1,000 rows). *The suite checks the order for small batches (A8); 1,000 rows rest on the probe.*
++- FastAPI answers 422 to invalid JSON, to a body that is not an object, to an empty body and to JSON sent as `text/plain`. *Re-confirmed: A9, A14.*
++- AnyIO's default thread limit is 40. It can be changed in the lifespan handler but not from a worker thread. *The values 40 and 10 are re-confirmed by a test; the worker-thread half rests on the probe.*
++- One transaction of 1,000 payments to 1,000 distinct payees held its locks for 109 ms (median of 7 runs; table in section 5.7). *Re-measured in the project (section 5.7).*
+ 
+ Docker was not available where the probes ran, so the design of the run stand (section 5.6) rested on the nginx and Compose documentation listed above. Checks S1–S3 have since run on Podman and the CI job on Docker Engine (section 13.8).
+ 
+ Claims the project's own tests must re-confirm on the pinned versions:
+ 
+-- the lock acquisition order for `ORDER BY ... FOR NO KEY UPDATE` (C2, C3, mutation check);
++- the lock acquisition order for `ORDER BY ... FOR NO KEY UPDATE` (C2, C3, mutation check; behaviorally only in most runs, see section 13.7);
+ - the behavior of `ON CONFLICT DO NOTHING` after waiting on another transaction (I5);
+ - the effect of `lock_timeout` on a unique-index wait, and error code 55P03 (C5, C8);
+ - a 422 response to invalid JSON and to non-object bodies in the FastAPI version in use (A9, A14);
+-- the thread limit for synchronous endpoints (section 10).
++- the thread limit for synchronous endpoints (section 10; its value, not its behavior under load, see section 9.3).
+diff --git a/docs/verification-notes.md b/docs/verification-notes.md
+index 879f4b0..45a0b0e 100644
+--- a/docs/verification-notes.md
++++ b/docs/verification-notes.md
+@@ -116,6 +116,17 @@ none verified:
+ 
+ Spec 13.7 expects "C2 or C3" to fail under M2; here C3 is the test that does.
+ 
++The independent review (see the last section) repeated M2 ten times with
++`uv run --locked pytest tests/concurrency/test_races.py tests/concurrency/test_multiprocess.py`:
++
++- C3 failed in 9 runs. In the tenth, every behavioral test stayed green.
++- `test_c7_crossing_over_http`, the two-firm crossing over HTTP against four uvicorn processes, failed in 3 runs.
++- C2 failed in none.
++
++So the two-firm case does deadlock without `ORDER BY` once the transactions come from separate
++processes, and catching M2 by behavior depends on scheduling. The statement-order test fails under M2
++every time, because it pins the text of the lock query; it is the deterministic guard.
++
+ ### M3: payer and payees locked in two queries
+ 
+ Change: the single lock query replaced by two. The first is
+@@ -142,7 +153,7 @@ Process 6011 waits for ExclusiveLock on tuple (0,5) of relation 56818 of databas
+ CONTEXT:  while locking tuple (0,5) in relation "firms"
+ ```
+ 
+-Every mutation turned at least one behavioral test red, so the tests were not strengthened.
++Every mutation turned at least one behavioral test red in the runs above, so the tests were not strengthened. The independent review later saw one M2 run in ten with every behavioral test green (see M2).
+ 
+ ## Claims re-confirmed
+ 
+@@ -150,11 +161,11 @@ These are the five claims at the end of spec section 17.
+ 
+ | Claim | Settled by | Result |
+ |---|---|---|
+-| Lock acquisition order for `ORDER BY ... FOR NO KEY UPDATE` | `test_c3_cycle_and_random_mix` (200 batches, cycle A→B→C→A, seed 20261121, 16 threads) with mutations M2 and M3; `test_c2_crossing_payments` (20 rounds × 50 crossing transactions) with M3; plans captured with `auto_explain` | Confirmed. With `ORDER BY id`, C3 had no `busy` outcome and logged no deadlock in any run. Without it (M2), C3 deadlocked in 3 of 3 runs. Locking the payer and the payees in separate queries (M3) deadlocks both C2 and C3. C2 shows that crossing payments do not deadlock with the code as written. It is not evidence for the `ORDER BY` half of the claim: it also stayed green under M2 (see M2). Plan as executed on PostgreSQL 18.6: every lock query captured with `auto_explain` during C2 and C3 ran as `LockRows` above `Sort (Sort Key: id)` above `Bitmap Heap Scan on firms` (`Bitmap Index Scan on uq_firms_uuid`). The container log was incomplete: it held 1,125 of the 1,200 expected lock queries, and other statements were missing in a similar proportion. This is the shape spec 8.3 relies on, with `LockRows` above `Sort`. A manual `EXPLAIN` on the three seed rows gives the same shape with a `Seq Scan` under the `Sort`. |
++| Lock acquisition order for `ORDER BY ... FOR NO KEY UPDATE` | `test_c3_cycle_and_random_mix` (200 batches, cycle A→B→C→A, seed 20261121, 16 threads) with mutations M2 and M3; `test_c2_crossing_payments` (20 rounds × 50 crossing transactions) with M3; plans captured with `auto_explain` | Confirmed. With `ORDER BY id`, C3 had no `busy` outcome and logged no deadlock in any run. Without it (M2), C3 deadlocked in 3 of 3 runs here and in 9 of 10 runs of the independent review. Locking the payer and the payees in separate queries (M3) deadlocks both C2 and C3. C2 shows that crossing payments do not deadlock with the code as written. It is not evidence for the `ORDER BY` half of the claim: it also stayed green under M2 (see M2). Plan as executed on PostgreSQL 18.6: every lock query captured with `auto_explain` during C2 and C3 ran as `LockRows` above `Sort (Sort Key: id)` above `Bitmap Heap Scan on firms` (`Bitmap Index Scan on uq_firms_uuid`). The container log was incomplete: it held 1,125 of the 1,200 expected lock queries, and other statements were missing in a similar proportion. This is the shape spec 8.3 relies on, with `LockRows` above `Sort`. A manual `EXPLAIN` on the three seed rows gives the same shape with a `Seq Scan` under the `Sort`. |
+ | `ON CONFLICT DO NOTHING` after waiting on another transaction | `test_i5_same_key_in_parallel` (10 rounds × 8 threads, one key), `test_key_wait_then_commit_replays`, `test_key_wait_then_rollback_executes` | Confirmed. Each I5 round gave exactly 1 `created` and 7 `replayed`, identical bodies, 3 payment rows, Pinecrest 3 674 875 and one key row. With another transaction holding the key row, the request waits. After that transaction commits, the request returns the committed response and changes nothing. After it rolls back, the request executes and claims the key. |
+ | `lock_timeout` bounds the unique-index wait; error code 55P03 | `test_key_wait_respects_lock_timeout` (C8), `test_c5_lock_timeout`, `test_c5_http_503` | Confirmed. With an uncommitted key row held elsewhere and `lock_timeout_ms=200`, the request returns `busy` after at least 200 ms, and the cause is SQLSTATE `55P03`. The row-lock wait (C5) behaves the same way. Over HTTP the response is 503 `busy` with `Retry-After: 1`. Nothing changed in any of these cases. |
+ | 422 for invalid JSON and non-object bodies in FastAPI 0.165.0 | `tests/api/test_validation.py::test_non_object_bodies` (`[]`, `"x"`, `null`, `123`, invalid JSON, empty body, JSON sent as `text/plain`, invalid UTF-8) and `::test_a9_schema_violations` | Confirmed. Every case gives 422 `validation_error`. |
+-| Thread limit for synchronous endpoints (spec section 10) | `test_thread_limit_matches_pool_size` | Confirmed on AnyIO 4.16.0. A fresh event loop reports 40 tokens. In the application's loop after the lifespan has run, the limit is 10, which is `DB_POOL_SIZE`. |
++| Thread limit for synchronous endpoints (spec section 10) | `test_thread_limit_matches_pool_size` | Confirmed on AnyIO 4.16.0. A fresh event loop reports 40 tokens. In the application's loop after the lifespan has run, the limit is 10, which is `DB_POOL_SIZE`. This settles the value, not the behavior under load: see the independent review, finding 4. |
+ 
+ Also observed: with the only pooled connection checked out, `execute_bulk_payment` raises
+ `ServiceBusy` whose cause is `sqlalchemy.exc.TimeoutError` (`test_pool_exhaustion_is_busy`,
+@@ -441,3 +452,41 @@ First run on the public repository: run 45408968632 on 2026-11-24, commit 6abb68
+   - Pinecrest's balance was 3674875.
+ 
+ This is the first run of the stand on Docker Engine; everything before it ran on Podman.
++
++## Independent review
++
++Agent workflow step 5, run on 2026-11-24 in a new Claude Code session on Claude Fable 5.2. The
++session saw only a clone of the repository at 8c1107e, with the branch checked out by hand. It
++ran on Podman 5.8.2 with Compose v5.1.3, not on Docker Engine. It did not run the load test L1.
++
++Acceptance (spec section 14.2), as the reviewer reported it:
++
++- `make up`: `db` and `lb` running, three `app` replicas, `migrate` exited with code 0.
++- The page 4 sample: 201; balances 3674875 / 170075 / 1405050.
++- Three more times: 201, 201, 422 `insufficient_funds`.
++- `make reset` and the page 3 request: 201; balances 4849925 / 170075 / 230000.
++- S2: three distinct `X-Upstream` values (10 / 11 / 9 of 30 requests).
++- S3: five 201, four of them replays; one request took 2.01 s; the balance changed once.
++- `make check`: exit code 0, 159 tests (64 / 14 / 63 / 18), ruff and mypy clean.
++- With the database stopped, POST answered 500 `internal_error` (spec 8.2, row "Other"). Once
++  the database was back, the replicas recovered on their own.
++
++The search for an interleaving of two or three requests that breaks an invariant of spec 9.1 found
++none. Two scenarios were run on the stand:
++
++- three requests sharing one key, one of them waiting on a firm row lock;
++- a lock held past `lock_timeout`.
++
++Each executed the key at most once.
++
++The reviewer also measured the thread wait of finding 4. An external transaction held one firm row
++for 14 s while 45 parallel requests paid that firm:
++
++- 43 requests got 503 after 5.0 to 10.0 s;
++- two got 201 after 13.06 s;
++- one `/healthz` call took 2.97 s.
++
++The ledger stayed consistent: 4999998 / 50002, with an unchanged sum.
++
++The findings and what was done about each are listed in the README, section "How I worked".
++After the fixes the suite has 162 tests (65 / 14 / 65 / 18).
+diff --git a/tests/api/test_healthz.py b/tests/api/test_healthz.py
+index 794bde3..894d376 100644
+--- a/tests/api/test_healthz.py
++++ b/tests/api/test_healthz.py
+@@ -1,4 +1,26 @@
++from sqlalchemy.exc import OperationalError
++
++from app.db import get_session
++from app.main import app
++
++
+ def test_healthz_reports_ok(client):
+     r = client.get("/healthz")
+     assert r.status_code == 200
+     assert r.json() == {"status": "ok"}
++
++
++class _UnreachableDatabase:
++    def execute(self, *args, **kwargs):
++        raise OperationalError("SELECT 1", {}, Exception("connection refused"))
++
++
++def test_healthz_reports_unavailable(client):
++    # /healthz is for the balancer and Compose, so it keeps its own body (spec section 8.1).
++    app.dependency_overrides[get_session] = _UnreachableDatabase
++    try:
++        r = client.get("/healthz")
++    finally:
++        app.dependency_overrides.pop(get_session, None)
++    assert r.status_code == 503
++    assert r.json() == {"status": "unavailable"}
+diff --git a/tests/api/test_validation.py b/tests/api/test_validation.py
+index 5486647..5a208bf 100644
+--- a/tests/api/test_validation.py
++++ b/tests/api/test_validation.py
+@@ -62,6 +62,19 @@ def test_a9_schema_violations(client, db, payload):
+     assert balances(db) == before and payment_rows(db) == []
+ 
+ 
++def test_a9_payment_limit_checked_before_items(client):
++    # 1001 items with invalid amounts get one too_long detail, not one detail per item.
++    payload = bulk(PINECREST, *[(NAIR, "x")] * 1001)
++    error = assert_validation_error(client.post("/bulk-payments", json=payload))
++    assert error["details"] == [
++        {
++            "loc": ["body", "payments"],
++            "msg": "at most 1000 payments are allowed per request",
++            "type": "too_long",
++        }
++    ]
++
++
+ NON_OBJECT_BODIES = {
+     "array": (b"[]", JSON),
+     "string": (b'"x"', JSON),
+diff --git a/tests/unit/test_build_command.py b/tests/unit/test_build_command.py
+index e1b48fa..48bf989 100644
+--- a/tests/unit/test_build_command.py
++++ b/tests/unit/test_build_command.py
+@@ -39,15 +39,6 @@ def test_self_payment_rejected(settings):
+         build_command(_request(payload), None, settings)
+ 
+ 
+-def test_too_many_payments(settings):
+-    settings = settings.model_copy(update={"max_payments_per_request": 2})
+-    build_command(_request(bulk(PINECREST, (NAIR, "1"), (LOPEZ, "2"))), None, settings)
+-    payload = bulk(PINECREST, (NAIR, "1"), (LOPEZ, "2"), (NAIR, "3"))
+-    with pytest.raises(ValidationFailed) as excinfo:
+-        build_command(_request(payload), None, settings)
+-    assert _error_locs(excinfo) == [["body", "payments"]]
+-
+-
+ def test_description_too_long(settings):
+     payload = bulk(PINECREST, (NAIR, "1"), (LOPEZ, "2"))
+     payload["payments"][0]["description"] = "x" * 500
+diff --git a/tests/unit/test_schemas.py b/tests/unit/test_schemas.py
+index 2a3353b..ee86cae 100644
+--- a/tests/unit/test_schemas.py
++++ b/tests/unit/test_schemas.py
+@@ -69,3 +69,18 @@ def test_lone_surrogate_in_raw_json_is_rejected():
+ def test_sample_request_is_valid():
+     request = BulkPaymentRequest.model_validate(SAMPLE_REQUEST)
+     assert [p.amount for p in request.payments] == ["6250", "5800.5", "1200.75"]
++
++
++def test_payment_count_checked_before_items():
++    # 1001 items, each with an invalid amount: one too_long error, not 1001 amount errors.
++    payload = _request(payments=[{**SAMPLE_REQUEST["payments"][0], "amount": "x"}] * 1001)
++    with pytest.raises(ValidationError) as excinfo:
++        BulkPaymentRequest.model_validate(payload)
++    errors = excinfo.value.errors()
++    assert [(e["loc"], e["type"]) for e in errors] == [(("payments",), "too_long")]
++    assert errors[0]["msg"] == "at most 1000 payments are allowed per request"
++
++
++def test_payment_count_at_limit_accepted():
++    payload = _request(payments=[SAMPLE_REQUEST["payments"][0]] * 1000)
++    assert len(BulkPaymentRequest.model_validate(payload).payments) == 1000

@@ -14,9 +14,9 @@ The allocation below is my judgment on that basis. If limits allow, steps 2 and 
 
 ## General rules for all steps
 
-1. Steps 0–1 and step 5 are separate sessions. Steps 1a–4 run in one controller session under superpowers:subagent-driven-development: the controller dispatches a fresh implementer subagent per plan task with the model named in the table below, a task reviewer after each task, and a whole-branch review at the end. This replaced one session per step (decided 2026-11-24) because it is faster and keeps a review after every task.
-2. Logs. Every working session goes to `ai-logs/`: the design sessions, the controller session together with each subagent's transcript, and the review session. The only change is masking the account email and the home directory path. Aborted early attempts are left out. The README says both things plainly, because the task asks for unedited logs.
-3. The agent does not deviate from the specification. If it finds a contradiction or gap, it stops and asks. Under subagent-driven execution the controller rules on it, records the ruling in its ledger, and reports it.
+1. Steps 0–1 and step 5 are separate sessions. Steps 1a–4b run in one controller session under superpowers:subagent-driven-development: the controller dispatches a fresh implementer subagent per plan task with the model named in the table below, a task reviewer after each task, and a whole-branch review at the end. This replaced one session per step (decided 2026-11-24) because it is faster and keeps a review after every task. Step 6 also ran in that session, at the author's request.
+2. Logs. Every working session goes to `ai-logs/raw/` unedited: the controller session together with each subagent's transcript, and the review session. The only change is masking the account email and the local user name. Aborted early attempts are left out. Next to the raw transcripts, an English translation of each session's dialogue is the version to read; it leaves out thinking and tool output. The README says all of this plainly, because the task asks for unedited logs.
+3. The agent does not deviate from the specification. If it finds a contradiction or gap, it stops and asks. Under subagent-driven execution the controller rules on it, records the ruling in its ledger, and reports it. The rulings are in the controller session's log; `docs/plan.md` (Execution Record) lists what they changed.
 4. You read each step's output before moving to the next and record your own edits as separate commits. Reviewers evaluate exactly this involvement.
 5. Code, comments, commit messages and the README are in English.
 
@@ -31,8 +31,9 @@ The allocation below is my judgment on that basis. If limits allow, steps 2 and 
 | 3 | Core: validation, transaction, idempotency, errors | Opus 5.5, implementer subagents | The cost of error is highest here: the order of transaction steps and locks |
 | 4 | Concurrency tests and load script | Opus 5.5, implementer subagents | Race tests are easy to write so that they pass by accident |
 | 4a | Whole-branch review of steps 2–4 | Fable 5.2, subagent | The final review needs the most capable model |
+| 4b | One fix wave for the whole-branch review's findings; scoped re-review | Opus 5.5 implementer; Sonnet 5.5 re-reviewer | One fixer with the complete list; a small re-review needs a cheaper model |
 | 5 | Independent review | Fable 5.2, new session | The reviewer must not see how the code was written |
-| 6 | README | You; Sonnet 5.5 for language editing | The README is read as your text; the substantive sections must be yours |
+| 6 | README | Opus 5.5 in the controller session, at the author's request; the author reviews it | The controller holds the rulings and measurements; the answers to the two questions stay the author's |
 
 ## Mapping to the implementation plan
 
@@ -143,10 +144,4 @@ Report format: a list of findings in descending severity; for each, the location
 
 ### Step 6. README
 
-You write the substantive sections: approach, encountered problems, assumptions, improvements. Sources: sections 4, 5 and 15 of the specification, and your notes from the work. A model is used only for language editing:
-
-```
-Below is my draft README in English. Fix grammar and style, preserving the structure, meaning and all technical claims. Do not add or remove anything substantive. Show the changes as a list.
-```
-
-The answers to the two questions at the end of the README (time spent and self-assessment) are yours alone.
+Changed on 2026-11-24: the author asked the controller session to draft the whole README (how to run and verify, what is implemented and why) from the specification, `docs/verification-notes.md`, the code and the author's outline. The README says so. The author reviews it; the answers to the two questions at the end (time spent and self-assessment) are the author's alone.
